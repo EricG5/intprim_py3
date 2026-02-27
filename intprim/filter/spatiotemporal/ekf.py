@@ -6,7 +6,7 @@ import numpy as np
 import scipy.linalg
 
 import intprim.constants
-import nonlinear_system
+from . import nonlinear_system
 
 ##
 #   The ExtendedKalmanFilter class localizes an interaction in time and space via the extended Kalman filter.

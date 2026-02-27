@@ -1,6 +1,5 @@
 from setuptools import setup, find_packages
 from setuptools.extension import Extension
-import numpy as np
 import sys
 
 setup(
@@ -11,5 +10,11 @@ setup(
     author='Joseph Campbell',
     author_email='jacampb1@asu.edu',
     license='MIT',
-    packages=find_packages()
+    packages=find_packages(),
+    install_requires=[
+        'numpy',
+        'scipy',
+        'matplotlib',
+        'scikit-learn',
+    ]
 )
