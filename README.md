@@ -56,7 +56,7 @@ The following Python libraries must be installed before IntPrim can be used:
 ## Installation
 To install this library, download the package and in the root directory run:
 
-python setup.py install --user
+pip install -e .
 
 ## Feedback
 Questions or comments may be directed to Joseph Campbell at <jacampb1@asu.edu>, Simon Stepputtis at <sstepput@asu.edu>, Geoffrey Clark at <gmclark1@asu.edu>, or Heni Ben Amor <hbenamor@asu.edu>.
