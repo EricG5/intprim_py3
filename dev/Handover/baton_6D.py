@@ -11,6 +11,19 @@ from scipy.spatial.transform import Rotation
 import baton_3D  
 
 
+# -----------------------------------------------------------------------------
+# TEMPORARY NOTE (world-frame training/testing)
+#
+# If you want to train + evaluate in the world frame (no taker-relative anchors),
+# keep trajectories in absolute coordinates.
+#
+# This file previously normalized positions by subtracting the taker start
+# position, then later added it back via `denormalize_6d(..., taker_anchor)`.
+# For world-frame work we comment out the normalization steps and pass
+# `taker_anchors=[None]` into `evaluate_6d`.
+# -----------------------------------------------------------------------------
+
+
 
 def denormalize_6d(trajectory, anchor):
     """Add the position anchor back to position DOFs (0:3, 6:9).
@@ -40,7 +53,7 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
     Args:
         primitive:     Trained BayesianInteractionPrimitive.
         filter:        EnKF or similar filter template (will be deep-copied).
-        test_trajectories: list of (12, T) arrays in normalized (taker-relative) coords.
+        test_trajectories: list of (12, T) arrays.
         observation_noise:  (12, 12) diagonal observation noise.
         taker_anchors: list of (3, 1) arrays — taker world-frame start position.
         time_step:     Observations per inference call.
@@ -162,7 +175,7 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
             pos_dev = (pred_ctrl_pos - ctrl_pos_mean) / (ctrl_pos_std + 1e-9)
             rot_dev = (pred_ctrl_rot - ctrl_rot_mean) / (ctrl_rot_std + 1e-9)
 
-            print("\n--- Final-pose handover quality check (normalised coords) ---")
+            print("\n--- Final-pose handover quality check (trajectory coords) ---")
             print(f"  Predicted  ctrl final pos [x,y,z]  : {pred_ctrl_pos}")
             print(f"  Training   mean ± std              : {ctrl_pos_mean} ± {ctrl_pos_std}")
             print(f"  Deviation  (σ)                     : {pos_dev}")
@@ -215,13 +228,18 @@ if __name__ == "__main__":
         taker_6d = np.hstack((taker_pos, taker_rot))  # (T, 6)
 
         raw_traj = np.concatenate((baton_6d.T, taker_6d.T), axis=0)  # (12, T)
+
+        # --- TEMP: world-frame training (no anchors/offsets) -----------------
+        training_trajectories.append(raw_traj)
+
+        # --- Previous behavior (taker-relative normalization) ----------------
         # Normalize position DOFs relative to taker start; leave rotation vectors unchanged.
-        anchor = raw_traj[6:9, 0:1].copy()     # taker position start (3, 1)
-        norm_traj = raw_traj.copy()
-        norm_traj[0:3, :] -= anchor            # giver position
-        norm_traj[6:9, :] -= anchor            # taker position
-        # rotation vector DOFs (3:6, 9:12) are already origin-independent
-        training_trajectories.append(norm_traj)
+        # anchor = raw_traj[6:9, 0:1].copy()     # taker position start (3, 1)
+        # norm_traj = raw_traj.copy()
+        # norm_traj[0:3, :] -= anchor            # giver position
+        # norm_traj[6:9, :] -= anchor            # taker position
+        # # rotation vector DOFs (3:6, 9:12) are already origin-independent
+        # training_trajectories.append(norm_traj)
         
         # Plotting individual paired trajectories - Don't do with big dataset, useful for sanity check
         # if i < 1:
@@ -313,11 +331,13 @@ if __name__ == "__main__":
     # plt.show()  # Block until the user closes the plot window(s)
 
     # Export trained model
-    primitive.export_data("baton_6d_model.bip")
+    primitive.export_data("baton_6d_model_world.bip")
 
     observation_noise = np.diag(selection.get_model_mse(basis_model_gaussian, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
-
-    print(observation_noise)
+    
+    # for i in range(len(observation_noise)):
+    #     print("Observation noise for DOF %d (%s): %f" % (i, dof_names[i], observation_noise[i,i]))
+    # print(observation_noise)
 
     # Compute the phase mean and phase velocities from the demonstrations.
     phase_velocity_mean, phase_velocity_var = intprim.examples.get_phase_stats(training_trajectories)
@@ -352,12 +372,16 @@ if __name__ == "__main__":
 
     raw_test_trajectory = np.concatenate((test_baton_6d.T, test_taker_6d.T), axis=0)  # (12, T)
 
-    # Normalize position DOFs relative to taker start; leave rotvec unchanged.
-    taker_anchor = raw_test_trajectory[6:9, 0:1].copy()  # (3, 1)
+    # --- TEMP: world-frame testing (no anchors/offsets) ----------------------
     test_trajectory = raw_test_trajectory.copy()
-    test_trajectory[0:3, :] -= taker_anchor   # giver position
-    test_trajectory[6:9, :] -= taker_anchor   # taker position
-    print("Taker anchor (world-frame start): ", taker_anchor.T)
+
+    # --- Previous behavior (taker-relative normalization) --------------------
+    # Normalize position DOFs relative to taker start; leave rotvec unchanged.
+    # taker_anchor = raw_test_trajectory[6:9, 0:1].copy()  # (3, 1)
+    # test_trajectory = raw_test_trajectory.copy()
+    # test_trajectory[0:3, :] -= taker_anchor   # giver position
+    # test_trajectory[6:9, :] -= taker_anchor   # taker position
+    # print("Taker anchor (world-frame start): ", taker_anchor.T)
 
     
     # Test to push observed outside known demo set (simulate different interpersonal spacing)
@@ -432,7 +456,8 @@ if __name__ == "__main__":
     # Evaluate the trajectories: step=1 gives a per-index live view.
     # Data was recorded at 120 Hz, so each index = 1/120 s ≈ 0.00833 s.
     evaluate_6d(primitive, filter, [test_trajectory], observation_noise,
-                taker_anchors=[taker_anchor], time_step=1, pause_secs=1.0 / RECORDING_HZ,
+                # TEMP: world-frame -> no denormalization offsets
+                taker_anchors=[None], time_step=1, pause_secs=1.0 / RECORDING_HZ,
                 observe_controlled_start=(baton_start_offset is not None),
                 training_handover_stats=handover_stats)
 
