@@ -446,7 +446,7 @@ if __name__ == "__main__":
         print("Baton ground-truth start offset (normalised): ", baton_start_offset,
               "— blended to zero by end of trajectory")
         
-    np.savetxt("test_trajectory.csv", raw_test_trajectory.T, delimiter=",", header="X_ctrl,Y_ctrl,Z_ctrl,RX_ctrl,RY_ctrl,RZ_ctrl,X_obs,Y_obs,Z_obs,RX_obs,RY_obs,RZ_obs", comments="")
+    # np.savetxt("test_trajectory.csv", raw_test_trajectory.T, delimiter=",", header="X_ctrl,Y_ctrl,Z_ctrl,RX_ctrl,RY_ctrl,RZ_ctrl,X_obs,Y_obs,Z_obs,RX_obs,RY_obs,RZ_obs", comments="")
     
     # Delayed start test: add stationary data points to start of trajectory to simulate a late start in the observed agent's motion.  This checks whether the filter can handle an initial period of static observation before the interaction begins.
     # delayed_start_test_trajectory = np.zeros((12, test_trajectory.shape[1] + 30), dtype=test_trajectory.dtype)
