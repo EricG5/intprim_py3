@@ -286,7 +286,10 @@ class StatCollector():
                     gen_node.set("same_mode", str(related))
                     gen_node.text = ",".join(["%.4f" % value for value in cov_values.flatten()])
 
-        out_file = open(file_name, "w")
-        out_file.write(ET.tostring(stats))
+        # Python 3: ET.tostring(...) returns bytes unless encoding='unicode'.
+        # Write a proper UTF-8 text file.
+        xml_text = ET.tostring(stats, encoding="unicode")
+        with open(file_name, "w", encoding="utf-8") as out_file:
+            out_file.write(xml_text)
 
         print("File " + str(file_name) + " successfully exported.")

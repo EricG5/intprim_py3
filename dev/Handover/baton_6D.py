@@ -3,12 +3,35 @@ import intprim
 import numpy as np
 import trajPlotting
 from pathlib import Path
+import json
+import datetime
 import matplotlib.pyplot as plt
 import re
 import copy
 import sklearn.metrics
 from scipy.spatial.transform import Rotation
 import baton_3D  
+# Quaternions have a sign ambiguity: q and -q represent the same rotation.
+# Many data sources will arbitrarily flip signs over time. Converting such a
+# sequence to axis-angle / rotvec can create apparent "jitter" (discontinuities)
+# even if the underlying orientation is smooth. We fix this by normalizing and
+# forcing consecutive quaternions into the same hemisphere.
+def _continuous_quats(quats, eps=1e-12):
+    """Return a copy of quats normalized and made sign-continuous over time.
+
+    Args:
+        quats: (T, 4) array of quaternions in [x, y, z, w] order.
+    """
+    q = np.array(quats, copy=True)
+    norms = np.linalg.norm(q, axis=1, keepdims=True)
+    norms = np.maximum(norms, eps)
+    q = q / norms
+
+    for i in range(1, q.shape[0]):
+        if float(np.dot(q[i - 1], q[i])) < 0.0:
+            q[i] *= -1.0
+    return q
+
 
 
 # -----------------------------------------------------------------------------
@@ -46,7 +69,9 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
                 training_handover_stats=None,
                 drop_redundant_stationary_obs=True,
                 stationary_pos_eps=1e-3,
-                stationary_rot_eps=5e-3):
+                stationary_rot_eps=5e-3,
+                stats_export_dir=None,
+                stats_debug_name="baton_6D"):
     """Run 6D BIP inference over test trajectories with live 3D + orientation viewer.
 
     Like baton_3D.evaluate but operates on 12-DOF trajectories
@@ -125,6 +150,28 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
 
         last_gen_world = mean_world
 
+        stat_collector = None
+        if stats_export_dir is not None:
+            stats_export_dir = Path(stats_export_dir)
+            stats_export_dir.mkdir(parents=True, exist_ok=True)
+
+            # Collect PDFs and ensemble projections for the generated (controlled)
+            # DoFs while treating the observed (taker) DoFs as observations.
+            generated_dof_indices = np.array([0, 1, 2, 3, 4, 5], dtype=np.int32)
+            stat_collector = intprim.util.stat_collector.StatCollector(
+                primitive,
+                generated_indices=generated_dof_indices,
+                observed_indices=observed_dof_indices,
+            )
+
+            # Seed with an initial timestep (clock=None is expected by exporter).
+            stat_collector.collect(
+                primitive,
+                observed_trajectory=test_trajectory_partial[:, :1].T,
+                generated_trajectory=mean_trajectory[:, :1].T,
+                timestamp=None,
+            )
+
         mean_mse = 0.0
         phase_mae = 0.0
         mse_count = 0
@@ -161,6 +208,14 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
                 active_dofs,
                 num_samples=test_trajectory_partial.shape[1] - observed_index,
             )
+
+            if stat_collector is not None:
+                stat_collector.collect(
+                    primitive,
+                    observed_trajectory=test_trajectory[:, prev_observed_index:observed_index].T,
+                    generated_trajectory=gen_trajectory.T,
+                    timestamp=float(observed_index),
+                )
 
             gen_world = denormalize_6d(gen_trajectory, taker_anchor) if taker_anchor is not None else gen_trajectory
             last_gen_world = gen_world
@@ -228,6 +283,21 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
 
         viewer.keep_open()
 
+        if stat_collector is not None:
+            # The XML exporter assumes >=3 timesteps (it extrapolates an
+            # initial timestamp from the first two real ones).
+            if len(stat_collector.timestep_clock) >= 3:
+                stat_collector.export(
+                    primitive,
+                    str(stats_export_dir),
+                    debug_bag_file=str(stats_debug_name),
+                    response_length=int(test_trajectory.shape[1]),
+                    use_spt=False,
+                    spt_phase="current",
+                )
+            else:
+                print("[stats] Skipping XML export: not enough timesteps collected.")
+
 
 if __name__ == "__main__":
     # Set a seed for reproducibility
@@ -259,9 +329,9 @@ if __name__ == "__main__":
         # Convert quaternions (cols 3:7, [x,y,z,w]) to rotation vectors (3D axis-angle).
         # This avoids double-cover and unit-norm issues that raw quaternions cause in BIP.
         baton_pos = baton_approach[:, :3]                                      # (T, 3)
-        baton_rot = Rotation.from_quat(baton_approach[:, 3:7]).as_rotvec()     # (T, 3)
+        baton_rot = Rotation.from_quat(_continuous_quats(baton_approach[:, 3:7])).as_rotvec()     # (T, 3)
         taker_pos = taker_approach[:, :3]
-        taker_rot = Rotation.from_quat(taker_approach[:, 3:7]).as_rotvec()
+        taker_rot = Rotation.from_quat(_continuous_quats(taker_approach[:, 3:7])).as_rotvec()
 
         mean_baton_start[0] += baton_pos[0,0]
         mean_baton_start[1] += baton_pos[0,1]
@@ -340,6 +410,32 @@ if __name__ == "__main__":
         ctrl_rot_std=final_ctrl_rot.std(axis=0),
     )
 
+    # Analysis output directory (used for optional JSON summary + XML stats).
+    analysis_dir = Path(__file__).resolve().parent / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set to True if you want a one-shot JSON dump of training-set summary stats.
+    # This is independent of the per-timestep XML stat collection.
+    EXPORT_TRAINING_SUMMARY_JSON = False
+
+    def _jsonify(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.floating, np.integer)):
+            return value.item()
+        return value
+
+    if EXPORT_TRAINING_SUMMARY_JSON:
+        training_summary = {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "num_pairs": int(len(pairs)),
+            "mean_baton_start_world": _jsonify(mean_baton_start),
+            "handover_stats": {k: _jsonify(v) for k, v in handover_stats.items()},
+        }
+        summary_path = analysis_dir / "baton_6d_training_summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(training_summary, f, indent=2, sort_keys=True)
+
     # Define DOFs: 12 total — 6 per agent (pos + rotvec)
     dof_names = np.array([
         "X (Controlled)", "Y (Controlled)", "Z (Controlled)",
@@ -414,9 +510,9 @@ if __name__ == "__main__":
 
         # Convert quaternions to rotation vectors (same as training data).
         test_baton_pos = test_baton_approach[:, :3]
-        test_baton_rot = Rotation.from_quat(test_baton_approach[:, 3:7]).as_rotvec()
+        test_baton_rot = Rotation.from_quat(_continuous_quats(test_baton_approach[:, 3:7])).as_rotvec()
         test_taker_pos = test_taker_approach[:, :3]
-        test_taker_rot = Rotation.from_quat(test_taker_approach[:, 3:7]).as_rotvec()
+        test_taker_rot = Rotation.from_quat(_continuous_quats(test_taker_approach[:, 3:7])).as_rotvec()
 
         test_baton_6d = np.hstack((test_baton_pos, test_baton_rot))  # (T, 6)
         test_taker_6d = np.hstack((test_taker_pos, test_taker_rot))  # (T, 6)
@@ -510,7 +606,9 @@ if __name__ == "__main__":
                     # TEMP: world-frame -> no denormalization offsets
                     taker_anchors=[None], time_step=1, pause_secs=1.0 / RECORDING_HZ,
                     observe_controlled_start=(baton_start_offset is not None),
-                    training_handover_stats=handover_stats)
+                    training_handover_stats=handover_stats,
+                    stats_export_dir=analysis_dir,
+                    stats_debug_name=f"{test_baton_path.name}|{test_taker_path.name}")
     
 
 
