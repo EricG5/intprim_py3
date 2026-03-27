@@ -28,7 +28,7 @@ if __name__ == "__main__":
     primitive = intprim.BayesianInteractionPrimitive(basis_model_gaussian)
 
     model_name = "baton_6d_model_world.bip"
-    model_path = Path(__file__).parent / model_name
+    model_path = Path(__file__).parent / "models" / model_name
     primitive.import_data(model_path)
 
     mean, upper_bound, lower_bound = primitive.get_probability_distribution()
