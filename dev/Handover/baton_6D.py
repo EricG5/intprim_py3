@@ -43,7 +43,10 @@ def denormalize_6d(trajectory, anchor):
 def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
                 taker_anchors=None, delay_prob=0.0, delay_ratio=0.0,
                 time_step=1, pause_secs=0.04, observe_controlled_start=False,
-                training_handover_stats=None):
+                training_handover_stats=None,
+                drop_redundant_stationary_obs=True,
+                stationary_pos_eps=1e-3,
+                stationary_rot_eps=5e-3):
     """Run 6D BIP inference over test trajectories with live 3D + orientation viewer.
 
     Like baton_3D.evaluate but operates on 12-DOF trajectories
@@ -79,6 +82,22 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
     # the first step when observe_controlled_start=True.
     observed_dof_indices_with_ctrl_pos = np.array([0, 1, 2, 6, 7, 8, 9, 10, 11], dtype=np.int32)
 
+    def _is_stationary_step(traj, prev_col, curr_col, active_dofs):
+        """Return True if active DoFs changed less than eps between columns."""
+        if prev_col < 0 or curr_col < 0:
+            return False
+
+        # Position indices among active DoFs.
+        pos_mask = np.isin(active_dofs, np.array([0, 1, 2, 6, 7, 8], dtype=np.int32))
+        rot_mask = np.isin(active_dofs, np.array([3, 4, 5, 9, 10, 11], dtype=np.int32))
+
+        diffs = np.abs(traj[active_dofs, curr_col] - traj[active_dofs, prev_col])
+        if np.any(pos_mask) and np.max(diffs[pos_mask]) > stationary_pos_eps:
+            return False
+        if np.any(rot_mask) and np.max(diffs[rot_mask]) > stationary_rot_eps:
+            return False
+        return True
+
     for test_trajectory, taker_anchor in zip(test_trajectories, taker_anchors):
         test_trajectory_partial = np.array(test_trajectory, copy=True)
         # Zero out controlled/robot DOFs (0:6) — unobserved at inference.
@@ -104,6 +123,8 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
             arrow_length=0.04,
         )
 
+        last_gen_world = mean_world
+
         mean_mse = 0.0
         phase_mae = 0.0
         mse_count = 0
@@ -116,6 +137,24 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
                 if (is_first_step and observe_controlled_start)
                 else observed_dof_indices
             )
+
+            # If the observation hasn't changed (within eps), don't feed repeated
+            # stationary frames into the phase filter. Repeated identical updates
+            # can collapse phase-velocity variance and make inference "stick" at
+            # the beginning when long stationary prefixes are present.
+            if drop_redundant_stationary_obs and not is_first_step:
+                prev_col = (prev_observed_index - 1) if prev_observed_index > 0 else 0
+                curr_col = observed_index - 1
+                if _is_stationary_step(test_trajectory, prev_col, curr_col, active_dofs):
+                    plot_obs = (
+                        denormalize_6d(test_trajectory_partial[:, :observed_index], taker_anchor)
+                        if taker_anchor is not None
+                        else test_trajectory_partial[:, :observed_index]
+                    )
+                    viewer.update(last_gen_world, plot_obs)
+                    prev_observed_index = observed_index
+                    continue
+
             gen_trajectory, phase, mean, var = primitive.generate_probable_trajectory_recursive(
                 test_trajectory_partial[:, prev_observed_index:observed_index],
                 observation_noise,
@@ -124,6 +163,7 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
             )
 
             gen_world = denormalize_6d(gen_trajectory, taker_anchor) if taker_anchor is not None else gen_trajectory
+            last_gen_world = gen_world
             test_future_world = denormalize_6d(test_trajectory[:, observed_index:], taker_anchor) if taker_anchor is not None else test_trajectory[:, observed_index:]
 
             mse = sklearn.metrics.mean_squared_error(test_future_world, gen_world)
@@ -207,10 +247,14 @@ if __name__ == "__main__":
 
     training_trajectories = []
     mean_baton_start = np.zeros(3)
+    full_traj_start = 0
+    delay = 0
     for i in range(len(pairs)):
         pair_id, baton_path, taker_path = pairs[i]
         baton, taker = baton_3D.load_handover_pair(baton_path, taker_path)
-        baton_approach, taker_approach = baton_3D.process_approach(baton[:400, :], taker[:400, :], 50)
+        baton_approach, taker_approach = baton_3D.process_approach(baton[:400, :], taker[:400, :], 50, delay)
+        # Skip pre-process of approach to include full behaviour before approach
+        # baton_approach, taker_approach = baton[full_traj_start:400, :], taker[full_traj_start:400, :]
 
         # Convert quaternions (cols 3:7, [x,y,z,w]) to rotation vectors (3D axis-angle).
         # This avoids double-cover and unit-norm issues that raw quaternions cause in BIP.
@@ -242,7 +286,7 @@ if __name__ == "__main__":
         # training_trajectories.append(norm_traj)
         
         # Plotting individual paired trajectories - Don't do with big dataset, useful for sanity check
-        # if i < 1:
+        # if i < 2:
         #     fig, ax, ani = trajPlotting.plot_animate(
         #     baton_approach,
         #     taker_approach,
@@ -304,162 +348,170 @@ if __name__ == "__main__":
         "RX (Observed)", "RY (Observed)", "RZ (Observed)",
     ])
 
-    # Basis space selection
-    selection = intprim.basis.Selection(dof_names)
+    # Set to True to run training and evaluation; False to just visualize trajectories
+    train_flag = True
+    if (train_flag):
+        # Basis space selection
+        selection = intprim.basis.Selection(dof_names)
 
-    for trajectory in training_trajectories:
-        selection.add_demonstration(trajectory)
+        for trajectory in training_trajectories:
+            selection.add_demonstration(trajectory)
 
-    # aic, bic = selection.get_information_criteria(np.array([0, 1], dtype = np.int32))
-    # selection.get_best_model(aic, bic)
+        # aic, bic = selection.get_information_criteria(np.array([0, 1], dtype = np.int32))
+        # selection.get_best_model(aic, bic)
 
-    basis_model_gaussian = intprim.basis.GaussianModel(5, 0.16, dof_names)
+        basis_model_gaussian = intprim.basis.GaussianModel(5, 0.16, dof_names)
+        # basis_model_sigmoidal = intprim.basis.SigmoidalModel(5, 0.19, dof_names)
 
-    # basis_model_gaussian.plot()
+        # basis_model_gaussian.plot()
 
-    # Initialize a BIP instance.
-    primitive = intprim.BayesianInteractionPrimitive(basis_model_gaussian)
+        # Initialize a BIP instance.
+        primitive = intprim.BayesianInteractionPrimitive(basis_model_gaussian)
+        # primitive = intprim.BayesianInteractionPrimitive(basis_model_sigmoidal)
 
-    # Train the model.
-    for trajectory in training_trajectories:
-        primitive.add_demonstration(trajectory)
+        # Train the model.
+        for trajectory in training_trajectories:
+            primitive.add_demonstration(trajectory)
 
-    # Plot the distribution of the trained model.
-    mean, upper_bound, lower_bound = primitive.get_probability_distribution()
-    # print("Lower bound (DOF 0): ", lower_bound[0])
-    # intprim.util.visualization.plot_distribution(dof_names, mean, upper_bound, lower_bound)
-    # plt.show()  # Block until the user closes the plot window(s)
+        # Plot the distribution of the trained model.
+        mean, upper_bound, lower_bound = primitive.get_probability_distribution()
+        # print("Lower bound (DOF 0): ", lower_bound[0])
+        # intprim.util.visualization.plot_distribution(dof_names, mean, upper_bound, lower_bound)
+        # plt.show()  
 
-    # Export trained model
-    primitive.export_data("baton_6d_model_world.bip")
+        # Export trained model
+        primitive.export_data("full_baton_6d_model_world.bip")
 
-    observation_noise = np.diag(selection.get_model_mse(basis_model_gaussian, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
-    
-    # for i in range(len(observation_noise)):
-    #     print("Observation noise for DOF %d (%s): %f" % (i, dof_names[i], observation_noise[i,i]))
-    # print(observation_noise)
-
-    # Compute the phase mean and phase velocities from the demonstrations.
-    phase_velocity_mean, phase_velocity_var = intprim.examples.get_phase_stats(training_trajectories)
-    # print("Phase velocity mean: %f, variance: %f" % (phase_velocity_mean, phase_velocity_var))
-
-    #Define a filter to use. Here we use an ensemble Kalman filter
-    filter = intprim.filter.spatiotemporal.EnsembleKalmanFilter(
-    basis_model = basis_model_gaussian,
-    initial_phase_mean = [0.0, phase_velocity_mean],
-    initial_phase_var = [1e-4, phase_velocity_var],
-    proc_var = 1e-8,
-    initial_ensemble = primitive.basis_weights)
-
-    # Create testing data
-    dtype = intprim.constants.DTYPE
-
-    test_baton_path = testdata_dir / "baton_058.csv"
-    test_taker_path = testdata_dir / "taker_058.csv"
-    test_baton = np.loadtxt(str(test_baton_path), delimiter=",", dtype=dtype, skiprows=1)
-    test_taker = np.loadtxt(str(test_taker_path), delimiter=",", dtype=dtype, skiprows=1)
-    # test_taker[:,0] += 0.10  # Shift the taker X position by +5 cm to test spatial robustness.
-    test_baton_approach, test_taker_approach = baton_3D.process_approach(test_baton[:400, :], test_taker[:400, :], 50)
-
-    # Convert quaternions to rotation vectors (same as training data).
-    test_baton_pos = test_baton_approach[:, :3]
-    test_baton_rot = Rotation.from_quat(test_baton_approach[:, 3:7]).as_rotvec()
-    test_taker_pos = test_taker_approach[:, :3]
-    test_taker_rot = Rotation.from_quat(test_taker_approach[:, 3:7]).as_rotvec()
-
-    test_baton_6d = np.hstack((test_baton_pos, test_baton_rot))  # (T, 6)
-    test_taker_6d = np.hstack((test_taker_pos, test_taker_rot))  # (T, 6)
-
-    raw_test_trajectory = np.concatenate((test_baton_6d.T, test_taker_6d.T), axis=0)  # (12, T)
-
-    # --- TEMP: world-frame testing (no anchors/offsets) ----------------------
-    test_trajectory = raw_test_trajectory.copy()
-
-    # --- Previous behavior (taker-relative normalization) --------------------
-    # Normalize position DOFs relative to taker start; leave rotvec unchanged.
-    # taker_anchor = raw_test_trajectory[6:9, 0:1].copy()  # (3, 1)
-    # test_trajectory = raw_test_trajectory.copy()
-    # test_trajectory[0:3, :] -= taker_anchor   # giver position
-    # test_trajectory[6:9, :] -= taker_anchor   # taker position
-    # print("Taker anchor (world-frame start): ", taker_anchor.T)
-
-    
-    # Test to push observed outside known demo set (simulate different interpersonal spacing)
-    # test_trajectory[6,:] += 0.20
-    # test_trajectory[7,:] += 0.10
-
-    # Apply a phase-scaled offset to the taker (DOFs 3-5) to simulate the human
-    # reaching for a different handover location.  The offset is zero at t=0
-    # (start position unchanged) and reaches full value at the end of the
-    # trajectory.  Adjust dx/dy/dz to explore spatial robustness.
-    # taker_endpoint_offset = [0.0, 0.0, -0.10]  # metres: [dx, dy, dz]
-    # test_trajectory = apply_endpoint_offset(test_trajectory, taker_endpoint_offset)
-    # print("Taker endpoint offset (taker-relative frame): ", taker_endpoint_offset)
-
-    # Temporal robustness test: stretch the trajectory to 2x duration while
-    # keeping the same motion profile.  The BIP was trained on normal-speed
-    # demos; this checks whether the phase estimator can track a slower execution.
-    RECORDING_HZ = 120
-    STRETCH_FACTOR = 1.0
-    test_trajectory = baton_3D.stretch_trajectory(test_trajectory, STRETCH_FACTOR)
-    print(f"Trajectory stretched {STRETCH_FACTOR}x: {test_trajectory.shape[1]} timesteps "
-          f"({test_trajectory.shape[1] / RECORDING_HZ:.2f} s at {RECORDING_HZ} Hz)")
-
-
-
-    # fig, ax, ani = trajPlotting.plot_animate(
-    #     test_baton_approach,
-    #     test_taker_approach,
-    #     interval=20,
-    #     show=True,
-    #     labels=("baton", "taker"),
-    # )
-
-    # trajPlotting.plot_animate(test_baton_approach, test_taker_approach, interval=20, show=True, labels=("baton", "taker"))
-
-    # -------------------------------------------------------------------------
-    # Baton start-position offset (normalized / taker-relative coords).
-    #
-    # Simulates a deployment scenario where the robot (controlled agent) starts
-    # at a different position than in the training demonstrations.  In training,
-    # the taker starts at [0,0,0] (normalized).  Here we shift the ground-truth
-    # baton trajectory by an arbitrary offset to test how well the BIP copes.
-    #
-    # Because the robot's starting pose is KNOWN at deployment time, we set
-    # observe_controlled_start=True so the filter observes the baton position
-    # DOFs [0,1,2] at t=0 only, anchoring it to the actual start before
-    # switching to taker-only observations for the rest of the interaction.
-    #
-    # Set to None to reproduce normal (in-distribution) behaviour.
-    # -------------------------------------------------------------------------
-    baton_start_offset = None  # e.g. np.array([0.05, 0.0, -0.02]) metres
-    # baton_start_offset = np.array([0.00, 0.1, 0.0])
-    
-    if baton_start_offset is not None:
-        baton_start_offset = np.asarray(baton_start_offset, dtype=test_trajectory.dtype)
-        T = test_trajectory.shape[1]
-        # Linear blend: full offset at t=0, zero offset at t=T-1.
-        # The baton starts displaced but converges back to the original
-        # (training-consistent) handover location by the end of the motion.
-        blend = np.linspace(1.0, 0.0, T, dtype=test_trajectory.dtype)  # (T,)
-        test_trajectory[0:3, :] += baton_start_offset[:, np.newaxis] * blend[np.newaxis, :]
-        print("Baton ground-truth start offset (normalised): ", baton_start_offset,
-              "— blended to zero by end of trajectory")
+        observation_noise = np.diag(selection.get_model_mse(basis_model_gaussian, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
+        # observation_noise = np.diag(selection.get_model_mse(basis_model_sigmoidal, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
         
-    # np.savetxt("test_trajectory.csv", raw_test_trajectory.T, delimiter=",", header="X_ctrl,Y_ctrl,Z_ctrl,RX_ctrl,RY_ctrl,RZ_ctrl,X_obs,Y_obs,Z_obs,RX_obs,RY_obs,RZ_obs", comments="")
-    
-    # Delayed start test: add stationary data points to start of trajectory to simulate a late start in the observed agent's motion.  This checks whether the filter can handle an initial period of static observation before the interaction begins.
-    # delayed_start_test_trajectory = np.zeros((12, test_trajectory.shape[1] + 30), dtype=test_trajectory.dtype)
-    # delayed_start_test_trajectory[:, 30:test_trajectory.shape[1]+30] = test_trajectory
-    # delayed_start_test_trajectory[:, :30] = test_trajectory[:, 0:1]  # Prepend 30 frames of the initial pose to simulate a delayed start with static initial observation.
+        # for i in range(len(observation_noise)):
+        #     print("Observation noise for DOF %d (%s): %f" % (i, dof_names[i], observation_noise[i,i]))
+        # print(observation_noise)
 
-    # Evaluate the trajectories: step=1 gives a per-index live view.
-    # Data was recorded at 120 Hz, so each index = 1/120 s ≈ 0.00833 s.
-    evaluate_6d(primitive, filter, [test_trajectory], observation_noise,
-                # TEMP: world-frame -> no denormalization offsets
-                taker_anchors=[None], time_step=1, pause_secs=1.0 / RECORDING_HZ,
-                observe_controlled_start=(baton_start_offset is not None),
-                training_handover_stats=handover_stats)
+        # Compute the phase mean and phase velocities from the demonstrations.
+        phase_velocity_mean, phase_velocity_var = intprim.examples.get_phase_stats(training_trajectories)
+        # print("Phase velocity mean: %f, variance: %f" % (phase_velocity_mean, phase_velocity_var))
+
+        #Define a filter to use. Here we use an ensemble Kalman filter
+        filter = intprim.filter.spatiotemporal.EnsembleKalmanFilter(
+        basis_model = basis_model_gaussian,
+        initial_phase_mean = [0.0, phase_velocity_mean],
+        initial_phase_var = [1e-4, phase_velocity_var],
+        proc_var = 1e-8,
+        initial_ensemble = primitive.basis_weights)
+
+        # Create testing data
+        dtype = intprim.constants.DTYPE
+
+        test_baton_path = testdata_dir / "baton_058.csv"
+        test_taker_path = testdata_dir / "taker_058.csv"
+        test_baton = np.loadtxt(str(test_baton_path), delimiter=",", dtype=dtype, skiprows=1)
+        test_taker = np.loadtxt(str(test_taker_path), delimiter=",", dtype=dtype, skiprows=1)
+        # test_taker[:,0] += 0.10  # Shift the taker X position by +5 cm to test spatial robustness.
+        test_baton_approach, test_taker_approach = baton_3D.process_approach(test_baton[:400, :], test_taker[:400, :], 50, delay)
+        # test_baton_approach, test_taker_approach = test_baton[full_traj_start:400, :], test_taker[full_traj_start:400, :]
+
+        # Convert quaternions to rotation vectors (same as training data).
+        test_baton_pos = test_baton_approach[:, :3]
+        test_baton_rot = Rotation.from_quat(test_baton_approach[:, 3:7]).as_rotvec()
+        test_taker_pos = test_taker_approach[:, :3]
+        test_taker_rot = Rotation.from_quat(test_taker_approach[:, 3:7]).as_rotvec()
+
+        test_baton_6d = np.hstack((test_baton_pos, test_baton_rot))  # (T, 6)
+        test_taker_6d = np.hstack((test_taker_pos, test_taker_rot))  # (T, 6)
+
+        raw_test_trajectory = np.concatenate((test_baton_6d.T, test_taker_6d.T), axis=0)  # (12, T)
+
+        # --- TEMP: world-frame testing (no anchors/offsets) ----------------------
+        test_trajectory = raw_test_trajectory.copy()
+
+        # --- Previous behavior (taker-relative normalization) --------------------
+        # Normalize position DOFs relative to taker start; leave rotvec unchanged.
+        # taker_anchor = raw_test_trajectory[6:9, 0:1].copy()  # (3, 1)
+        # test_trajectory = raw_test_trajectory.copy()
+        # test_trajectory[0:3, :] -= taker_anchor   # giver position
+        # test_trajectory[6:9, :] -= taker_anchor   # taker position
+        # print("Taker anchor (world-frame start): ", taker_anchor.T)
+
+        
+        # Test to push observed outside known demo set (simulate different interpersonal spacing)
+        # test_trajectory[6,:] += 0.20
+        # test_trajectory[7,:] += 0.10
+
+        # Apply a phase-scaled offset to the taker (DOFs 3-5) to simulate the human
+        # reaching for a different handover location.  The offset is zero at t=0
+        # (start position unchanged) and reaches full value at the end of the
+        # trajectory.  Adjust dx/dy/dz to explore spatial robustness.
+        # taker_endpoint_offset = [0.0, 0.0, -0.10]  # metres: [dx, dy, dz]
+        # test_trajectory = apply_endpoint_offset(test_trajectory, taker_endpoint_offset)
+        # print("Taker endpoint offset (taker-relative frame): ", taker_endpoint_offset)
+
+        # Temporal robustness test: stretch the trajectory to 2x duration while
+        # keeping the same motion profile.  The BIP was trained on normal-speed
+        # demos; this checks whether the phase estimator can track a slower execution.
+        RECORDING_HZ = 120
+        STRETCH_FACTOR = 1.0
+        test_trajectory = baton_3D.stretch_trajectory(test_trajectory, STRETCH_FACTOR)
+        print(f"Trajectory stretched {STRETCH_FACTOR}x: {test_trajectory.shape[1]} timesteps "
+            f"({test_trajectory.shape[1] / RECORDING_HZ:.2f} s at {RECORDING_HZ} Hz)")
+
+
+
+        # fig, ax, ani = trajPlotting.plot_animate(
+        #     test_baton_approach,
+        #     test_taker_approach,
+        #     interval=20,
+        #     show=True,
+        #     labels=("baton", "taker"),
+        # )
+
+        # trajPlotting.plot_animate(test_baton_approach, test_taker_approach, interval=20, show=True, labels=("baton", "taker"))
+
+        # -------------------------------------------------------------------------
+        # Baton start-position offset (normalized / taker-relative coords).
+        #
+        # Simulates a deployment scenario where the robot (controlled agent) starts
+        # at a different position than in the training demonstrations.  In training,
+        # the taker starts at [0,0,0] (normalized).  Here we shift the ground-truth
+        # baton trajectory by an arbitrary offset to test how well the BIP copes.
+        #
+        # Because the robot's starting pose is KNOWN at deployment time, we set
+        # observe_controlled_start=True so the filter observes the baton position
+        # DOFs [0,1,2] at t=0 only, anchoring it to the actual start before
+        # switching to taker-only observations for the rest of the interaction.
+        #
+        # Set to None to reproduce normal (in-distribution) behaviour.
+        # -------------------------------------------------------------------------
+        baton_start_offset = None  # e.g. np.array([0.05, 0.0, -0.02]) metres
+        # baton_start_offset = np.array([0.00, 0.1, 0.0])
+        
+        if baton_start_offset is not None:
+            baton_start_offset = np.asarray(baton_start_offset, dtype=test_trajectory.dtype)
+            T = test_trajectory.shape[1]
+            # Linear blend: full offset at t=0, zero offset at t=T-1.
+            # The baton starts displaced but converges back to the original
+            # (training-consistent) handover location by the end of the motion.
+            blend = np.linspace(1.0, 0.0, T, dtype=test_trajectory.dtype)  # (T,)
+            test_trajectory[0:3, :] += baton_start_offset[:, np.newaxis] * blend[np.newaxis, :]
+            print("Baton ground-truth start offset (normalised): ", baton_start_offset,
+                "— blended to zero by end of trajectory")
+            
+        # np.savetxt("test_trajectory.csv", raw_test_trajectory.T, delimiter=",", header="X_ctrl,Y_ctrl,Z_ctrl,RX_ctrl,RY_ctrl,RZ_ctrl,X_obs,Y_obs,Z_obs,RX_obs,RY_obs,RZ_obs", comments="")
+        
+        # Delayed start test: add stationary data points to start of trajectory to simulate a late start in the observed agent's motion.  This checks whether the filter can handle an initial period of static observation before the interaction begins.
+        # delayed_start_test_trajectory = np.zeros((12, test_trajectory.shape[1] + 30), dtype=test_trajectory.dtype)
+        # delayed_start_test_trajectory[:, 30:test_trajectory.shape[1]+30] = test_trajectory
+        # delayed_start_test_trajectory[:, :30] = test_trajectory[:, 0:1]  # Prepend 30 frames of the initial pose to simulate a delayed start with static initial observation.
+
+        # Evaluate the trajectories: step=1 gives a per-index live view.
+        # Data was recorded at 120 Hz, so each index = 1/120 s ≈ 0.00833 s.
+        evaluate_6d(primitive, filter, [test_trajectory], observation_noise,
+                    # TEMP: world-frame -> no denormalization offsets
+                    taker_anchors=[None], time_step=1, pause_secs=1.0 / RECORDING_HZ,
+                    observe_controlled_start=(baton_start_offset is not None),
+                    training_handover_stats=handover_stats)
+    
 
 
     plt.show()

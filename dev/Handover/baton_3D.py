@@ -131,17 +131,20 @@ def stretch_trajectory(trajectory, factor):
     return np.vstack([np.interp(x_new, x_old, trajectory[d]) for d in range(D)])
 
 
-def process_approach(baton, taker, cutoff):
+def process_approach(baton, taker, cutoff, delay):
     start = np.average(baton[:cutoff, 2])
     for i in range(cutoff, baton.shape[0]):
         if baton[i, 2] > start + 0.01:
             # print("Cutoff at index %d, z: %f" % (i, baton[i, 2]))
-            return baton[i:,:], taker[i:,:]
+            start = max(i - delay, 0)
+            return baton[start:,:], taker[start:,:]
     print("No cutoff found, returning full trajectories")
     return baton, taker
     
 
-def evaluate(primitive, filter, test_trajectories, observation_noise, giver_anchors=None, delay_prob=0.0, delay_ratio=0.0, time_step=1, pause_secs=0.04):
+def evaluate(primitive, filter, test_trajectories, observation_noise, giver_anchors=None,
+             delay_prob=0.0, delay_ratio=0.0, time_step=1, pause_secs=0.04,
+             drop_redundant_stationary_obs=True, stationary_pos_eps=1e-3):
     """Run BIP inference over test trajectories.
 
     Args:
@@ -156,6 +159,12 @@ def evaluate(primitive, filter, test_trajectories, observation_noise, giver_anch
     """
     if giver_anchors is None:
         giver_anchors = [None] * len(test_trajectories)
+
+    def _is_stationary_step(traj, prev_col, curr_col, active_dofs):
+        if prev_col < 0 or curr_col < 0:
+            return False
+        diffs = np.abs(traj[active_dofs, curr_col] - traj[active_dofs, prev_col])
+        return np.max(diffs) <= stationary_pos_eps
 
     for test_trajectory, giver_anchor in zip(test_trajectories, giver_anchors):
         test_trajectory_partial = np.array(test_trajectory, copy=True)
@@ -176,11 +185,22 @@ def evaluate(primitive, filter, test_trajectories, observation_noise, giver_anch
             pause_secs=pause_secs,
         )
 
+        last_gen_trajectory_world = mean_world
+
         mean_mse = 0.0
         phase_mae = 0.0
         mse_count = 0
         prev_observed_index = 0
         for observed_index in range(time_step, test_trajectory.shape[1], time_step):
+            if drop_redundant_stationary_obs and prev_observed_index > 0:
+                prev_col = prev_observed_index - 1
+                curr_col = observed_index - 1
+                if _is_stationary_step(test_trajectory, prev_col, curr_col, np.array([3, 4, 5], dtype=np.int32)):
+                    plot_obs = denormalize_interaction(test_trajectory_partial[:, :observed_index], giver_anchor) if giver_anchor is not None else test_trajectory_partial[:, :observed_index]
+                    viewer.update(last_gen_trajectory_world, plot_obs)
+                    prev_observed_index = observed_index
+                    continue
+
             gen_trajectory, phase, mean, var = primitive.generate_probable_trajectory_recursive(
                 test_trajectory_partial[:, prev_observed_index:observed_index],
                 observation_noise,
@@ -190,6 +210,7 @@ def evaluate(primitive, filter, test_trajectories, observation_noise, giver_anch
 
             # Recover world coordinates for MSE and plotting.
             gen_trajectory_world = denormalize_interaction(gen_trajectory, giver_anchor) if giver_anchor is not None else gen_trajectory
+            last_gen_trajectory_world = gen_trajectory_world
             test_future_world = denormalize_interaction(test_trajectory[:, observed_index:], giver_anchor) if giver_anchor is not None else test_trajectory[:, observed_index:]
 
             mse = sklearn.metrics.mean_squared_error(test_future_world, gen_trajectory_world)
