@@ -33,6 +33,48 @@ def _continuous_quats(quats, eps=1e-12):
     return q
 
 
+_MIRROR_S_XZ = np.diag([1.0, -1.0, 1.0])
+
+
+def mirror_6d_across_xz_plane(trajectory_12d, y0=None):
+    """Mirror a (12, T) [pos+rotvec per agent] trajectory across the x–z plane.
+
+    This simulates left/right-handed interactions by reflecting the world-space
+    Y coordinate. Positions are mirrored as y' = 2*y0 - y.
+
+    Rotation vectors are mirrored by converting to rotation matrices and
+    conjugating with the reflection matrix S=diag(1,-1,1): R' = S R S.
+    This yields a proper rotation (det=+1) and matches the standard animation/
+    robotics mirroring convention.
+
+    Args:
+        trajectory_12d: (12, T) array with DOFs:
+            ctrl pos [0:3], ctrl rotvec [3:6], obs pos [6:9], obs rotvec [9:12].
+        y0: Optional float specifying the mirror plane y=y0. If None, uses the
+            midline between the two agents at t=0.
+    """
+    traj = np.array(trajectory_12d, copy=True)
+    if traj.ndim != 2 or traj.shape[0] != 12:
+        raise ValueError(f"Expected trajectory shape (12, T); got {traj.shape}")
+
+    if y0 is None:
+        y0 = 0.5 * (float(traj[1, 0]) + float(traj[7, 0]))
+
+    # Mirror positions (invert Y about plane y=y0)
+    traj[1, :] = (2.0 * y0) - traj[1, :]
+    traj[7, :] = (2.0 * y0) - traj[7, :]
+
+    # Mirror orientations for both agents.
+    for rot_slice in (slice(3, 6), slice(9, 12)):
+        rotvec = traj[rot_slice, :].T  # (T, 3)
+        rot_mats = Rotation.from_rotvec(rotvec).as_matrix()  # (T, 3, 3)
+        rot_mats_m = _MIRROR_S_XZ @ rot_mats @ _MIRROR_S_XZ
+        rotvec_m = Rotation.from_matrix(rot_mats_m).as_rotvec()  # (T, 3)
+        traj[rot_slice, :] = rotvec_m.T
+
+    return traj
+
+
 
 # -----------------------------------------------------------------------------
 # TEMPORARY NOTE (world-frame training/testing)
@@ -71,7 +113,8 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
                 stationary_pos_eps=1e-3,
                 stationary_rot_eps=5e-3,
                 stats_export_dir=None,
-                stats_debug_name="baton_6D"):
+                stats_debug_name="baton_6D",
+                save_stats=True):
     """Run 6D BIP inference over test trajectories with live 3D + orientation viewer.
 
     Like baton_3D.evaluate but operates on 12-DOF trajectories
@@ -97,6 +140,8 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
             computed from training demos.  When provided, the final predicted
             endpoint difference (controlled − observed) is compared against
             the training distribution and printed as a handover quality check.
+        save_stats: If False, disables StatCollector collection/export even if
+            stats_export_dir is provided.
     """
     if taker_anchors is None:
         taker_anchors = [None] * len(test_trajectories)
@@ -151,7 +196,7 @@ def evaluate_6d(primitive, filter, test_trajectories, observation_noise,
         last_gen_world = mean_world
 
         stat_collector = None
-        if stats_export_dir is not None:
+        if save_stats and stats_export_dir is not None:
             stats_export_dir = Path(stats_export_dir)
             stats_export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -303,6 +348,15 @@ if __name__ == "__main__":
     # Set a seed for reproducibility
     np.random.seed(213413414)
 
+    # Set to True to run training and evaluation; False to just visualize trajectories
+    train_flag = False
+
+    # Set True to simulate left-handed interactions by mirroring across the x–z
+    # plane (invert world-space Y). If the tracking-space origin isn't centered,
+    # leaving MIRROR_Y0=None mirrors about the per-trajectory midline at t=0.
+    SIMULATE_LEFT_HANDED = False
+    MIRROR_Y0 = None
+
     # Use a stable path so you can run from any working directory.
     data_dir = Path(__file__).resolve().parent / "trainingData"
     testdata_dir = Path(__file__).resolve().parent / "testingData"
@@ -342,6 +396,8 @@ if __name__ == "__main__":
         taker_6d = np.hstack((taker_pos, taker_rot))  # (T, 6)
 
         raw_traj = np.concatenate((baton_6d.T, taker_6d.T), axis=0)  # (12, T)
+        if SIMULATE_LEFT_HANDED:
+            raw_traj = mirror_6d_across_xz_plane(raw_traj, y0=MIRROR_Y0)
 
         # --- TEMP: world-frame training (no anchors/offsets) -----------------
         training_trajectories.append(raw_traj)
@@ -355,15 +411,15 @@ if __name__ == "__main__":
         # # rotation vector DOFs (3:6, 9:12) are already origin-independent
         # training_trajectories.append(norm_traj)
         
-        # Plotting individual paired trajectories - Don't do with big dataset, useful for sanity check
-        # if i < 2:
-        #     fig, ax, ani = trajPlotting.plot_animate(
-        #     baton_approach,
-        #     taker_approach,
-        #     interval=20,
-        #     show=True,
-        #     labels=("baton", "taker"),
-        #     )
+        # Plotting individual paired trajectories 
+        if (not train_flag and i <2):
+            fig, ax, ani = trajPlotting.plot_animate(
+            baton_approach,
+            taker_approach,
+            interval=20,
+            show=True,
+            labels=("baton", "taker"),
+            )
 
     mean_baton_start /= len(pairs)
     # print("Mean baton start position across demos (world-frame): ", mean_baton_start)
@@ -444,8 +500,6 @@ if __name__ == "__main__":
         "RX (Observed)", "RY (Observed)", "RZ (Observed)",
     ])
 
-    # Set to True to run training and evaluation; False to just visualize trajectories
-    train_flag = True
     if (train_flag):
         # Basis space selection
         selection = intprim.basis.Selection(dof_names)
@@ -518,6 +572,8 @@ if __name__ == "__main__":
         test_taker_6d = np.hstack((test_taker_pos, test_taker_rot))  # (T, 6)
 
         raw_test_trajectory = np.concatenate((test_baton_6d.T, test_taker_6d.T), axis=0)  # (12, T)
+        if SIMULATE_LEFT_HANDED:
+            raw_test_trajectory = mirror_6d_across_xz_plane(raw_test_trajectory, y0=MIRROR_Y0)
 
         # --- TEMP: world-frame testing (no anchors/offsets) ----------------------
         test_trajectory = raw_test_trajectory.copy()
