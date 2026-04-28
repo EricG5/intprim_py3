@@ -10,7 +10,7 @@ setup(
     author='Joseph Campbell',
     author_email='jacampb1@asu.edu',
     license='MIT',
-    packages=find_packages(),
+    packages=find_packages(exclude=("dev", "dev.*")),
     install_requires=[
         'numpy',
         'scipy',

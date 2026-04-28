@@ -223,8 +223,8 @@ if __name__ == "__main__":
         # Create testing data
         dtype = intprim.constants.DTYPE
 
-        test_baton_path = testdata_dir / "baton_060.csv"
-        test_taker_path = testdata_dir / "taker_060.csv"
+        test_baton_path = testdata_dir / "baton_059.csv"
+        test_taker_path = testdata_dir / "taker_059.csv"
         test_baton = np.loadtxt(str(test_baton_path), delimiter=",", dtype=dtype, skiprows=1)
         test_taker = np.loadtxt(str(test_taker_path), delimiter=",", dtype=dtype, skiprows=1)
         # test_taker[:,0] += 0.10  # Shift the taker X position by +5 cm to test spatial robustness.
