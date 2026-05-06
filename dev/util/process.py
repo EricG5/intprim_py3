@@ -43,11 +43,42 @@ def compute_euclidean_distance(traj1, traj2):
     
     return np.sqrt(np.sum((traj1 - traj2) ** 2, axis=1))
 
-def compute_cutoff(euclidean_distance, cutoff_margin=0.05, steady_state_window=50):
+def compute_cutoff(euclidean_distance, steady_state_window=50):
     """Compute the handover location cutoff in order to process only the approach to handover phase of the interaction."""
     cutoff = np.mean(euclidean_distance[-steady_state_window]) # Since receiver will have grasped the object in the last frames, this can be used as the cutoff
     cutoff_margin = np.std(euclidean_distance[-steady_state_window])
     for i in range(len(euclidean_distance)):
         if euclidean_distance[i] < cutoff + cutoff_margin: 
             return i
+    return None
+
+def get_interaction_start_indices(
+    trajectory,
+    steady_state_window=20,
+    z_sigma=4.0,
+    min_consecutive=5,
+    direction="up",
+):
+    """Get the starting indices of interaction phases based on when the receiver's hand begins to move."""
+    z_values = trajectory[:, 3]  # Assuming z-axis is vertical and trajectory is in the order [time, x, y, z]
+    starting_point = np.mean(z_values[:steady_state_window])
+    cutoff_margin = z_sigma * np.std(z_values[:steady_state_window])
+
+    consecutive = 0
+    for i in range(steady_state_window, len(z_values)):
+        delta = z_values[i] - starting_point
+        if direction == "up":
+            triggered = delta > cutoff_margin
+        elif direction == "down":
+            triggered = delta < -cutoff_margin
+        else:
+            triggered = np.abs(delta) > cutoff_margin
+
+        if triggered:
+            consecutive += 1
+            if consecutive >= min_consecutive:
+                return i - min_consecutive + 1
+        else:
+            consecutive = 0
+
     return None
