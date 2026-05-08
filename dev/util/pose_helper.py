@@ -6,7 +6,11 @@ def rotation_dim_reduction(trajectory):
     reduced_trajectory = np.zeros((trajectory.shape[0], 3)) # 3 orientation
     for i in range(trajectory.shape[0]):
         quat = trajectory[i, :] # Assuming quaternion is in the order [qw, qx, qy, qz]
-        r = R.from_quat(quat, scalar_first=True) # Create a rotation object from the quaternion
+        try:
+            r = R.from_quat(quat, scalar_first=True) # SciPy >= 1.10
+        except TypeError:
+            quat_xyzw = np.array([quat[1], quat[2], quat[3], quat[0]], dtype=float)
+            r = R.from_quat(quat_xyzw) # Older SciPy expects [qx, qy, qz, qw]
         rot_vec = r.as_rotvec() # Convert to angle-axis representation (rotation vector)
         reduced_trajectory[i, :] = rot_vec
 

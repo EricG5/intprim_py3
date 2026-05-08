@@ -24,6 +24,8 @@ if __name__ == "__main__":
     controlled_general_pose = "Hat_Giver"
     observed_general_pose = "Hat_Receiver"
 
+    mirror_to_left_handed = True
+
     # Plot the trajectories of the controlled and observed agents for each trajectory segment.
     if False:
         # for i in range(0, len(start_indices_[controlled_agent])):
@@ -124,6 +126,16 @@ if __name__ == "__main__":
             training_data[:, 3:6] = rotation_dim_reduction(combined_data[f"{i}"][:, 4:8]) # Orientation of controlled agent
             training_data[:, 6:9] = combined_data[f"{i}"][:, 8:11] # Position of observed agent
             training_data[:, 9:12] = rotation_dim_reduction(combined_data[f"{i}"][:, 11:15]) # Orientation of observed agent
+
+            if mirror_to_left_handed:
+                controlled_head_positions = combined_data[f"{i}"][:, 15:18]
+                observed_head_positions = combined_data[f"{i}"][:, 22:25]
+                training_data = mirror_12d_trajectory_using_head_plane(
+                    training_data,
+                    controlled_head_positions=controlled_head_positions,
+                    observed_head_positions=observed_head_positions,
+                    up=(0.0, 0.0, 1.0),
+                )
             if i <= len(approach_cutoff_indices) - n_test_trajectories - 1:
                 training_trajectories.append(training_data.T)
             else:
@@ -162,11 +174,14 @@ if __name__ == "__main__":
         mean, upper_bound, lower_bound = primitive.get_probability_distribution()
         # intprim.util.visualization.plot_distribution(dof_names, mean, upper_bound, lower_bound)
 
-        # Export model
+        # Export model + test_trajectory csv for evaluation in ros2
         model_dir = Path(__file__).parent / "models"
         model_dir.mkdir(exist_ok=True)
-        model_file = model_dir / "handover_2026_05_8.bip"
+        model_file = model_dir / "mirrored_handover_2026_05_8.bip"
         primitive.export_data(model_file)
+
+        test_trajectory_file = model_dir / "mirrored_handover_test_trajectory.csv"
+        np.savetxt(test_trajectory_file, testing_trajectories[3][6:, :].T, delimiter=",", header="Observed_X,Observed_Y,Observed_Z,Observed_RX,Observed_RY,Observed_RZ", comments="")
 
         observation_noise = np.diag(selection.get_model_mse(basis_model_gaussian, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
         phase_velocity_mean, phase_velocity_var = intprim.examples.get_phase_stats(training_trajectories)
@@ -180,7 +195,7 @@ if __name__ == "__main__":
         proc_var = 1e-8,
         initial_ensemble = primitive.basis_weights)
 
-        evaluate_6d_matplotlib(primitive, filter, testing_trajectories[1], observation_noise)
+        evaluate_6d_matplotlib(primitive, filter, testing_trajectories[3], observation_noise)
 
 
 
