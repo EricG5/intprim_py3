@@ -43,13 +43,26 @@ def compute_euclidean_distance(traj1, traj2):
     
     return np.sqrt(np.sum((traj1 - traj2) ** 2, axis=1))
 
-def compute_cutoff(euclidean_distance, steady_state_window=50):
-    """Compute the handover location cutoff in order to process only the approach to handover phase of the interaction."""
-    cutoff = np.mean(euclidean_distance[-steady_state_window]) # Since receiver will have grasped the object in the last frames, this can be used as the cutoff
-    cutoff_margin = np.std(euclidean_distance[-steady_state_window])
+def compute_cutoff(
+    euclidean_distance,
+    steady_state_window=50,
+    sigma=4.5,
+    min_consecutive=5,
+):
+    """Compute the handover location cutoff for the approach-to-handover phase."""
+    steady_state = euclidean_distance[-steady_state_window:]
+    cutoff = np.mean(steady_state)  # Steady state after the receiver grasps the object.
+    cutoff_margin = sigma * np.std(steady_state)
+
+    consecutive = 0
     for i in range(len(euclidean_distance)):
-        if euclidean_distance[i] < cutoff + cutoff_margin: 
-            return i
+        if euclidean_distance[i] < cutoff + cutoff_margin:
+            consecutive += 1
+            if consecutive >= min_consecutive:
+                return i - min_consecutive + 1
+        else:
+            consecutive = 0
+
     return None
 
 def get_interaction_start_indices(
