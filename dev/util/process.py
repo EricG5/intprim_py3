@@ -73,45 +73,143 @@ def compute_mirror_transform_from_heads(
     return S, p0, n_unit
 
 
-def mirror_12d_trajectory_using_head_plane(
-    trajectory_12d,
+def _axis_letter_to_index(axis):
+    if isinstance(axis, str):
+        axis_l = axis.lower()
+        if axis_l == "x":
+            return 0
+        if axis_l == "y":
+            return 1
+        if axis_l == "z":
+            return 2
+    raise ValueError(f"axis must be one of 'x','y','z'; got {axis!r}")
+
+
+def _extract_global_yaw_from_rotation_matrix(
+    R_body_to_world,
+    *,
+    mode="legacy_euler",
+    body_forward_axis="x",
+):
+    """Extract a global +Z yaw angle from a rotation matrix.
+
+    Args:
+        R_body_to_world: (3,3) rotation matrix.
+        mode:
+            - 'legacy_euler': yaw = as_euler('zyx')[0]
+            - 'projected_forward': yaw from the chosen body forward axis projected onto world XY
+        body_forward_axis: 'x','y', or 'z' (used only for 'projected_forward')
+
+    Returns:
+        yaw angle (radians)
+    """
+    try:
+        from scipy.spatial.transform import Rotation
+    except Exception as exc:
+        raise ImportError("SciPy is required to extract yaw") from exc
+
+    R_body_to_world = np.asarray(R_body_to_world, dtype=float)
+    if R_body_to_world.shape != (3, 3):
+        raise ValueError(f"Expected R_body_to_world shape (3,3); got {R_body_to_world.shape}")
+
+    mode_l = str(mode).lower()
+    if mode_l in ("legacy", "legacy_euler", "euler"):
+        return float(Rotation.from_matrix(R_body_to_world).as_euler("zyx", degrees=False)[0])
+
+    if mode_l in ("projected_forward", "forward", "heading"):
+        axis_idx = _axis_letter_to_index(body_forward_axis)
+        forward_world = R_body_to_world[:, axis_idx]
+        norm_xy = float(np.hypot(forward_world[0], forward_world[1]))
+        if norm_xy < 1e-12:
+            return float(Rotation.from_matrix(R_body_to_world).as_euler("zyx", degrees=False)[0])
+        return float(np.arctan2(forward_world[1], forward_world[0]))
+
+    raise ValueError(f"Unknown yaw extraction mode: {mode!r}")
+
+
+def _rotation_from_quat_scalar_first(quats, Rotation):
+    """Create a SciPy Rotation from scalar-first quaternions.
+
+    Args:
+        quats: shape (4,) or (T,4) in (w,x,y,z) order.
+        Rotation: scipy.spatial.transform.Rotation class.
+    """
+    quats = np.asarray(quats, dtype=float)
+    try:
+        return Rotation.from_quat(quats, scalar_first=True)
+    except TypeError:
+        if quats.ndim == 1:
+            quat_xyzw = np.array([quats[1], quats[2], quats[3], quats[0]], dtype=float)
+        else:
+            quat_xyzw = np.column_stack((quats[:, 1], quats[:, 2], quats[:, 3], quats[:, 0]))
+        return Rotation.from_quat(quat_xyzw)
+
+
+def _quat_scalar_first_from_rotation(rot, Rotation):
+    """Convert a SciPy Rotation to scalar-first quaternions."""
+    try:
+        return rot.as_quat(scalar_first=True)
+    except TypeError:
+        quat_xyzw = rot.as_quat()
+        quat_xyzw = np.asarray(quat_xyzw, dtype=float)
+        if quat_xyzw.ndim == 1:
+            return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=float)
+        return np.column_stack((quat_xyzw[:, 3], quat_xyzw[:, 0], quat_xyzw[:, 1], quat_xyzw[:, 2]))
+
+
+def ensure_quaternion_hemisphere_continuity(quats_scalar_first):
+    """Flip quaternion signs over time to avoid discontinuities.
+
+    Ensures consecutive quaternions satisfy dot(q[t], q[t-1]) >= 0.
+
+    Args:
+        quats_scalar_first: (T,4) in (w,x,y,z)
+
+    Returns:
+        (T,4) quaternions with sign continuity.
+    """
+    quats = np.asarray(quats_scalar_first, dtype=float)
+    if quats.ndim != 2 or quats.shape[1] != 4:
+        raise ValueError(f"Expected quats shape (T,4); got {quats.shape}")
+    if quats.shape[0] <= 1:
+        return quats
+
+    fixed = np.array(quats, copy=True)
+    for i in range(1, fixed.shape[0]):
+        if float(np.dot(fixed[i], fixed[i - 1])) < 0.0:
+            fixed[i] *= -1.0
+    return fixed
+
+
+def mirror_trajectory_quats_using_head_plane(
+    controlled_positions,
+    controlled_quats,
+    observed_positions,
+    observed_quats,
+    *,
     controlled_head_positions,
     observed_head_positions,
     up=(0.0, 0.0, 1.0),
-    pos_slices=(slice(0, 3), slice(6, 9)),
-    rotvec_slices=(slice(3, 6), slice(9, 12)),
     return_transform=False,
 ):
-    """Mirror a 12D (pos+rotvec per agent) trajectory using a head-derived plane.
+    """Mirror two pose streams (pos + quaternion) using the head-derived plane.
 
-    Mirrors ONLY the controlled+observed agents (the 12D trajectory) and uses the
-    head trajectories only to define the mirror plane.
+    Quaternion convention is scalar-first (w,x,y,z).
 
-    Args:
-        trajectory_12d: (T, 12) or (12, T) array with DOFs:
-            ctrl pos [0:3], ctrl rotvec [3:6], obs pos [6:9], obs rotvec [9:12].
-        controlled_head_positions: (T, 3) head positions for the controlled agent.
-        observed_head_positions: (T, 3) head positions for the observed agent.
-        up: Global up direction.
-        pos_slices: Two slices for the position columns.
-        rotvec_slices: Two slices for the rotation-vector columns.
-        return_transform: If True, also returns (S, p0, n).
-
-    Returns:
-        mirrored_traj: same shape as input trajectory_12d
-        (optional) (S, p0, n)
+    Returns mirrored (controlled_positions, controlled_quats, observed_positions, observed_quats)
+    with the same shapes as inputs.
     """
-    traj = np.asarray(trajectory_12d, dtype=float)
-    transposed = False
-    if traj.ndim != 2:
-        raise ValueError(f"Expected a 2D array; got shape {traj.shape}")
-    if traj.shape[1] == 12:
-        traj_t = traj
-    elif traj.shape[0] == 12:
-        traj_t = traj.T
-        transposed = True
-    else:
-        raise ValueError(f"Expected shape (T,12) or (12,T); got {traj.shape}")
+    ctrl_pos = np.asarray(controlled_positions, dtype=float)
+    obs_pos = np.asarray(observed_positions, dtype=float)
+    ctrl_q = np.asarray(controlled_quats, dtype=float)
+    obs_q = np.asarray(observed_quats, dtype=float)
+
+    if ctrl_pos.shape != obs_pos.shape or ctrl_pos.ndim != 2 or ctrl_pos.shape[1] != 3:
+        raise ValueError("controlled_positions and observed_positions must both have shape (T,3)")
+    if ctrl_q.shape != obs_q.shape or ctrl_q.ndim != 2 or ctrl_q.shape[1] != 4:
+        raise ValueError("controlled_quats and observed_quats must both have shape (T,4)")
+    if ctrl_pos.shape[0] != ctrl_q.shape[0]:
+        raise ValueError("positions and quats must have the same length")
 
     S, p0, n = compute_mirror_transform_from_heads(
         controlled_head_positions=controlled_head_positions,
@@ -119,32 +217,221 @@ def mirror_12d_trajectory_using_head_plane(
         up=up,
     )
 
-    mirrored = np.array(traj_t, copy=True)
+    ctrl_pos_m = (ctrl_pos - p0) @ S.T + p0
+    obs_pos_m = (obs_pos - p0) @ S.T + p0
 
-    # Mirror positions: p' = p0 + S (p - p0)
-    for pos_slice in pos_slices:
-        P = mirrored[:, pos_slice]
-        mirrored[:, pos_slice] = (P - p0) @ S.T + p0
-
-    # Mirror orientations: R' = S R S  (where R from rotvec)
     try:
         from scipy.spatial.transform import Rotation
     except Exception as exc:
-        raise ImportError("SciPy is required to mirror rotation vectors") from exc
+        raise ImportError("SciPy is required to mirror quaternions") from exc
 
-    for rot_slice in rotvec_slices:
-        rotvec = mirrored[:, rot_slice]  # (T, 3)
-        rot_mats = Rotation.from_rotvec(rotvec).as_matrix()  # (T, 3, 3)
-        rot_mats_m = np.einsum("ij,tjk,kl->til", S, rot_mats, S)
-        rotvec_m = Rotation.from_matrix(rot_mats_m).as_rotvec()
-        mirrored[:, rot_slice] = rotvec_m
+    ctrl_rot = _rotation_from_quat_scalar_first(ctrl_q, Rotation)
+    obs_rot = _rotation_from_quat_scalar_first(obs_q, Rotation)
 
-    if transposed:
-        mirrored = mirrored.T
+    ctrl_mats = ctrl_rot.as_matrix()
+    obs_mats = obs_rot.as_matrix()
+    ctrl_mats_m = np.einsum("ij,tjk,kl->til", S, ctrl_mats, S)
+    obs_mats_m = np.einsum("ij,tjk,kl->til", S, obs_mats, S)
+
+    ctrl_q_m = _quat_scalar_first_from_rotation(Rotation.from_matrix(ctrl_mats_m), Rotation)
+    obs_q_m = _quat_scalar_first_from_rotation(Rotation.from_matrix(obs_mats_m), Rotation)
 
     if return_transform:
-        return mirrored, (S, p0, n)
-    return mirrored
+        return ctrl_pos_m, ctrl_q_m, obs_pos_m, obs_q_m, (S, p0, n)
+    return ctrl_pos_m, ctrl_q_m, obs_pos_m, obs_q_m
+
+
+def apply_reflection_to_positions(positions, *, S, p0):
+    """Apply a reflection transform about a plane/anchor point.
+
+    Uses the same row-vector convention as `mirror_trajectory_quats_using_head_plane`:
+        p' = (p - p0) @ S.T + p0
+
+    Args:
+        positions: (T,3) array
+        S: (3,3) reflection matrix
+        p0: (3,) point on the reflection plane
+
+    Returns:
+        (T,3) reflected positions
+    """
+    pos = np.asarray(positions, dtype=float)
+    S = np.asarray(S, dtype=float)
+    p0 = np.asarray(p0, dtype=float)
+
+    if pos.ndim != 2 or pos.shape[1] != 3:
+        raise ValueError(f"Expected positions shape (T,3); got {pos.shape}")
+    if S.shape != (3, 3):
+        raise ValueError(f"Expected S shape (3,3); got {S.shape}")
+    if p0.shape != (3,):
+        raise ValueError(f"Expected p0 shape (3,); got {p0.shape}")
+
+    return (pos - p0) @ S.T + p0
+
+
+def apply_reflection_to_quats(quats_scalar_first, *, S):
+    """Apply a reflection transform to scalar-first quaternions.
+
+    Mirrors a rotation matrix via: R' = S R S
+
+    Args:
+        quats_scalar_first: (T,4) array in (w,x,y,z)
+        S: (3,3) reflection matrix
+
+    Returns:
+        (T,4) mirrored quaternions in (w,x,y,z)
+    """
+    q = np.asarray(quats_scalar_first, dtype=float)
+    S = np.asarray(S, dtype=float)
+
+    if q.ndim != 2 or q.shape[1] != 4:
+        raise ValueError(f"Expected quats shape (T,4); got {q.shape}")
+    if S.shape != (3, 3):
+        raise ValueError(f"Expected S shape (3,3); got {S.shape}")
+    if q.shape[0] == 0:
+        return q
+
+    try:
+        from scipy.spatial.transform import Rotation
+    except Exception as exc:
+        raise ImportError("SciPy is required to mirror quaternions") from exc
+
+    mats = _rotation_from_quat_scalar_first(q, Rotation).as_matrix()
+    mats_m = np.einsum("ij,tjk,kl->til", S, mats, S)
+    return _quat_scalar_first_from_rotation(Rotation.from_matrix(mats_m), Rotation)
+
+
+def apply_local_axis_rotation_offset_to_quats(
+    quats_scalar_first,
+    *,
+    axis="Z",
+    angle_rad=np.pi,
+):
+    """Apply a constant local/body-fixed rotation about a local axis to quaternions.
+
+    Applies a local/body-fixed rotation offset: R_new = R @ R_offset.
+
+    Args:
+        quats_scalar_first: (T,4) array in (w,x,y,z)
+        axis: 'x', 'y', or 'z' local axis.
+        angle_rad: rotation angle in radians.
+
+    Returns:
+        (T,4) adjusted quaternions in (w,x,y,z)
+    """
+    q = np.asarray(quats_scalar_first, dtype=float)
+    if q.ndim != 2 or q.shape[1] != 4:
+        raise ValueError(f"Expected quats shape (T,4); got {q.shape}")
+
+    axis_l = str(axis).lower()
+    if axis_l not in ("x", "y", "z", "X", "Y", "Z"):
+        raise ValueError(f"axis must be one of 'x','y','z','X','Y','Z'; got {axis!r}")
+
+    try:
+        from scipy.spatial.transform import Rotation
+    except Exception as exc:
+        raise ImportError("SciPy is required to apply quaternion rotation offsets") from exc
+
+    rot = _rotation_from_quat_scalar_first(q, Rotation)
+    mats = rot.as_matrix()
+    R_offset = Rotation.from_euler(axis_l, float(angle_rad), degrees=False).as_matrix()
+    mats_new = np.einsum("tij,jk->tik", mats, R_offset)
+    return _quat_scalar_first_from_rotation(Rotation.from_matrix(mats_new), Rotation)
+
+
+def rebase_to_head_midpoint_floor_yaw_quat(
+    controlled_positions,
+    controlled_quats,
+    observed_positions,
+    observed_quats,
+    *,
+    controlled_head_positions,
+    observed_head_positions,
+    observed_head_quats,
+    yaw_mode="legacy_euler",
+    body_forward_axis="x",
+    midpoint_time="mean",
+    floor_z=0.0,
+    return_anchor=False,
+):
+    """Rebase pos+quat streams to a head-midpoint floor origin and observed-head yaw.
+
+    - Origin: floor-projected midpoint between controlled/observed head positions.
+    - Orientation: yaw-only about global +Z extracted from the observed head quaternion
+      at the start of the segment.
+
+    Quaternion convention is scalar-first (w,x,y,z).
+    """
+    ctrl_pos = np.asarray(controlled_positions, dtype=float)
+    obs_pos = np.asarray(observed_positions, dtype=float)
+    ctrl_q = np.asarray(controlled_quats, dtype=float)
+    obs_q = np.asarray(observed_quats, dtype=float)
+
+    ctrl_head_pos = np.asarray(controlled_head_positions, dtype=float)
+    obs_head_pos = np.asarray(observed_head_positions, dtype=float)
+    obs_head_q = np.asarray(observed_head_quats, dtype=float)
+
+    if ctrl_pos.shape != obs_pos.shape or ctrl_pos.ndim != 2 or ctrl_pos.shape[1] != 3:
+        raise ValueError("controlled_positions and observed_positions must both have shape (T,3)")
+    if ctrl_q.shape != obs_q.shape or ctrl_q.ndim != 2 or ctrl_q.shape[1] != 4:
+        raise ValueError("controlled_quats and observed_quats must both have shape (T,4)")
+    if ctrl_pos.shape[0] != ctrl_q.shape[0]:
+        raise ValueError("positions and quats must have the same length")
+    if ctrl_head_pos.ndim != 2 or ctrl_head_pos.shape[1] != 3:
+        raise ValueError("controlled_head_positions must have shape (T,3)")
+    if obs_head_pos.ndim != 2 or obs_head_pos.shape[1] != 3:
+        raise ValueError("observed_head_positions must have shape (T,3)")
+    if obs_head_q.ndim != 2 or obs_head_q.shape[1] != 4:
+        raise ValueError("observed_head_quats must have shape (T,4)")
+
+    if ctrl_pos.shape[0] == 0:
+        if return_anchor:
+            return ctrl_pos, ctrl_q, obs_pos, obs_q, (np.zeros(3), np.eye(3), 0.0)
+        return ctrl_pos, ctrl_q, obs_pos, obs_q
+
+    midpoint_time_l = str(midpoint_time).lower()
+    if midpoint_time_l not in ("mean",):
+        raise ValueError(f"Unsupported midpoint_time: {midpoint_time!r} (expected 'mean')")
+
+    p_ctrl = np.mean(ctrl_head_pos, axis=0) if ctrl_head_pos.shape[0] else np.zeros(3)
+    p_obs = np.mean(obs_head_pos, axis=0) if obs_head_pos.shape[0] else np.zeros(3)
+    p0 = 0.5 * (p_ctrl + p_obs)
+    p0 = np.asarray(p0, dtype=float)
+    p0[2] = float(floor_z)
+
+    try:
+        from scipy.spatial.transform import Rotation
+    except Exception as exc:
+        raise ImportError("SciPy is required to rebase quaternions") from exc
+
+    if obs_head_q.shape[0] == 0:
+        yaw0 = 0.0
+        R_base = np.eye(3)
+    else:
+        R_head0 = _rotation_from_quat_scalar_first(obs_head_q[0], Rotation).as_matrix()
+        yaw0 = _extract_global_yaw_from_rotation_matrix(
+            R_head0,
+            mode=yaw_mode,
+            body_forward_axis=body_forward_axis,
+        )
+        R_base = Rotation.from_euler("z", float(yaw0), degrees=False).as_matrix()
+
+    R_inv = R_base.T
+
+    ctrl_pos_r = (ctrl_pos - p0) @ R_inv.T
+    obs_pos_r = (obs_pos - p0) @ R_inv.T
+
+    ctrl_mats = _rotation_from_quat_scalar_first(ctrl_q, Rotation).as_matrix()
+    obs_mats = _rotation_from_quat_scalar_first(obs_q, Rotation).as_matrix()
+    ctrl_mats_r = np.einsum("ij,tjk->tik", R_inv, ctrl_mats)
+    obs_mats_r = np.einsum("ij,tjk->tik", R_inv, obs_mats)
+    ctrl_q_r = _quat_scalar_first_from_rotation(Rotation.from_matrix(ctrl_mats_r), Rotation)
+    obs_q_r = _quat_scalar_first_from_rotation(Rotation.from_matrix(obs_mats_r), Rotation)
+
+    if return_anchor:
+        return ctrl_pos_r, ctrl_q_r, obs_pos_r, obs_q_r, (p0, R_base, float(yaw0))
+    return ctrl_pos_r, ctrl_q_r, obs_pos_r, obs_q_r
+
 
 def csv_to_dict(file_path):
     """Import csv files from data directory and return a dictionary of numpy arrays."""
@@ -158,6 +445,7 @@ def csv_to_dict(file_path):
 
     return traj_data
 
+
 def get_traj_start_indices(traj_data, time_threshold=0.5):
     """Get the starting indices of trajectories based on time gaps."""
     start_indices = [0]  # Start with the first index
@@ -169,6 +457,7 @@ def get_traj_start_indices(traj_data, time_threshold=0.5):
         time_prev = traj_data[i, 0]
 
     return start_indices
+
 
 def segment_trajectories(traj_data, start_indices, print_info=True):
     """Segment trajectory data into a list of trajectories based on start indices."""
@@ -188,6 +477,7 @@ def compute_euclidean_distance(traj1, traj2):
         raise ValueError("Trajectories must have the same length.")
     
     return np.sqrt(np.sum((traj1 - traj2) ** 2, axis=1))
+
 
 def compute_cutoff(
     euclidean_distance,
@@ -210,6 +500,7 @@ def compute_cutoff(
             consecutive = 0
 
     return None
+
 
 def get_interaction_start_indices(
     trajectory,
