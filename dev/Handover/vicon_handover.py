@@ -143,6 +143,7 @@ if __name__ == "__main__":
     ## eBIP ##
     if True:
         training_trajectories = []
+        training_ctrl_quats = []
         testing_trajectories = []
         n_test_trajectories = 5
         for i in range(0, len(approach_cutoff_indices)):
@@ -246,6 +247,8 @@ if __name__ == "__main__":
                 # Shape: (13, T) = [time; 12 DoFs]
                 testing_trajectories.append(np.vstack((time_vec[None, :], training_data.T)))
 
+            training_ctrl_quats.append(ctrl_quat[0,:])
+
         # Visualize the trajectories
         # for i in range(0, len(approach_cutoff_indices)):
         #     visualize_pose_trajectories_matplotlib(combined_data[f"{i}"][:, 0], training_trajectories[i][:,:6], training_trajectories[i][:,6:12])
@@ -256,6 +259,10 @@ if __name__ == "__main__":
         mean_ctrl_start[2] = np.mean([traj[2, 0] for traj in training_trajectories])
         print(f"Mean starting position of controlled agent across training trajectories: {mean_ctrl_start}")
         print(f"+X axis forward from controlled agent's starting position")
+
+        # print(f"Starting quat shape of entire list: {np.array(training_ctrl_quats).shape}")
+        mean_ctrl_quat_start = np.mean(training_ctrl_quats, axis=0)
+        print(f"Mean starting quaternion of controlled agent across training trajectories: {mean_ctrl_quat_start} (qw, qx, qy, qz)")
 
 
 
@@ -291,13 +298,13 @@ if __name__ == "__main__":
         model_dir = Path(__file__).parent / "models"
         model_dir.mkdir(exist_ok=True)
         model_file = model_dir / "mirrored_handover_2026_05_8.bip"
-        primitive.export_data(model_file)
+        # primitive.export_data(model_file)
 
         test_save_index = 3
         # testing_trajectories entries are (13, T): [time; 12 DoFs]
         test_trajectory_save = testing_trajectories[test_save_index].T
         test_trajectory_file = model_dir / "mirrored_handover_test_trajectory.csv"
-        np.savetxt(test_trajectory_file, test_trajectory_save, delimiter=",", header="Time, Controlled_X, Controlled_Y, Controlled_Z, Controlled_RX, Controlled_RY, Controlled_RZ, Observed_X, Observed_Y, Observed_Z, Observed_RX, Observed_RY, Observed_RZ", comments="")
+        # np.savetxt(test_trajectory_file, test_trajectory_save, delimiter=",", header="Time, Controlled_X, Controlled_Y, Controlled_Z, Controlled_RX, Controlled_RY, Controlled_RZ, Observed_X, Observed_Y, Observed_Z, Observed_RX, Observed_RY, Observed_RZ", comments="")
 
         observation_noise = np.diag(selection.get_model_mse(basis_model_gaussian, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
         # mat = observation_noise
