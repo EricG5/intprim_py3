@@ -23,11 +23,11 @@ from dev.util.visualize import evaluate_6d_matplotlib
 
 if __name__ == "__main__":
     np.random.seed(213413414)
-    data_date = "2026_05_8"
+    data_date = "2026_05_12"
     data_dir = Path(__file__).parent / data_date
     # Import data from csv files in the data directory and store in a dictionary of numpy arrays.
     data_ = csv_to_dict(data_dir)
-
+    
     start_indices_ = {}
     for name in data_:
         start_indices_[name] = get_traj_start_indices(data_[name])
@@ -40,8 +40,8 @@ if __name__ == "__main__":
     controlled_general_pose = "Hat_Giver"
     observed_general_pose = "Hat_Receiver"
 
-    mirror_to_left_handed = True
-    apply_post_mirror_z_pi = True  # Apply constant local-axis rotation offset to both agents
+    mirror_to_left_handed = False
+    apply_post_mirror_z_pi = False  # Apply constant local-axis rotation offset to both agents
     post_mirror_offset_axis = "z"  # only used when apply_post_mirror_z_pi=True
     post_mirror_offset_angle = np.pi - np.pi/16
     rebase_to_head_midpoint_floor = True
@@ -84,7 +84,8 @@ if __name__ == "__main__":
 
     # Plot cutoff values with euclidean distance for each trajectory segment.
     if False:
-        for i in range(0, len(approach_cutoff_indices)):
+        # for i in range(0, len(approach_cutoff_indices)):
+        for i in range(0, 5):
             plt.figure()
             plt.title(f"Euclidean Distance between {controlled_agent} and {observed_agent} for Trajectory {i+1}")
             plt.plot(trajectories_[f"{controlled_agent}_{i}"][:, 0], euclidean_distance[f"{i}"], label="Euclidean Distance")
@@ -102,7 +103,31 @@ if __name__ == "__main__":
 
     interaction_start_indices = []
     for i in range(0, len(approach_cutoff_indices)):
-        interaction_start_indices.append(get_interaction_start_indices(trajectories_[f"{observed_agent}_{i}"][:approach_cutoff_indices[i]], steady_state_window=200, min_consecutive=50, direction="up"))
+        observed_pre_cutoff = trajectories_[f"{observed_agent}_{i}"][:approach_cutoff_indices[i]]
+        n_samples = observed_pre_cutoff.shape[0]
+
+        if n_samples == 0:
+            interaction_start_idx = 0
+            print(
+                f"Warning: Empty pre-cutoff segment for trajectory {i+1}; "
+                "defaulting to start index 0."
+            )
+            interaction_start_indices.append(interaction_start_idx)
+            continue
+
+        interaction_start_idx = get_interaction_start_indices(
+            observed_pre_cutoff,
+            steady_state_window=min(200, n_samples),
+            min_consecutive=min(50, n_samples),
+            direction="up",
+        )
+        if interaction_start_idx is None:
+            interaction_start_idx = 0
+            print(
+                f"Warning: No interaction start detected for trajectory {i+1}; "
+                "defaulting to start index 0."
+            )
+        interaction_start_indices.append(interaction_start_idx)
     #     plt.figure()
     #     plt.plot(trajectories_[f"{observed_agent}_{i}"][:approach_cutoff_indices[i], 0], trajectories_[f"{observed_agent}_{i}"][:approach_cutoff_indices[i], 3], label=f"{observed_agent} z")
     #     plt.vlines(x=trajectories_[f"{observed_agent}_{i}"][interaction_start_indices[i], 0], ymin= min(trajectories_[f"{observed_agent}_{i}"][:approach_cutoff_indices[i], 3]), ymax=max(trajectories_[f"{observed_agent}_{i}"][:approach_cutoff_indices[i], 3]), color="red", linestyle="--", label="Interaction Start")
@@ -110,35 +135,41 @@ if __name__ == "__main__":
         
     # print(f"Interaction start indices: {interaction_start_indices}")
 
-    
-
+    avoid_indices = [3, 4] # Trajectories 4 and 5 have poor data quality and will be removed from training/testing data
+    index_adjustment = 0
 
     combined_data = {}
     for i in range(0, len(approach_cutoff_indices)):
-        combined_data[f"{i}"] = np.zeros((approach_cutoff_indices[i]-interaction_start_indices[i], 1 + 7*len(data_))) # Time + 7 values (position and orientation) for each agent
-        combined_data[f"{i}"][:,0] = trajectories_[f"{controlled_agent}_{i}"][interaction_start_indices[i]:approach_cutoff_indices[i], 0] # Time
+        if i in avoid_indices:
+            index_adjustment += 1
+            continue
+
+        combined_data[f"{i-index_adjustment}"] = np.zeros((approach_cutoff_indices[i]-interaction_start_indices[i], 1 + 7*len(data_))) # Time + 7 values (position and orientation) for each agent
+        combined_data[f"{i-index_adjustment}"][:,0] = trajectories_[f"{controlled_agent}_{i}"][interaction_start_indices[i]:approach_cutoff_indices[i], 0] # Time
         suffix = f"_{i}"
         for name in trajectories_:
             if name.endswith(suffix):
                 if name.removesuffix(suffix) == controlled_agent:
-                    combined_data[f"{i}"][:, 1:8] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of controlled agent
+                    combined_data[f"{i-index_adjustment}"][:, 1:8] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of controlled agent
 
                 elif name.removesuffix(suffix) == observed_agent:
-                    combined_data[f"{i}"][:, 8:15] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of observed agent
+                    combined_data[f"{i-index_adjustment}"][:, 8:15] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of observed agent
 
                 elif name.removesuffix(suffix) == controlled_general_pose:
-                    combined_data[f"{i}"][:, 15:22] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of controlled agent's general pose
+                    combined_data[f"{i-index_adjustment}"][:, 15:22] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of controlled agent's general pose
 
                 elif name.removesuffix(suffix) == observed_general_pose:
-                    combined_data[f"{i}"][:, 22:29] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of observed agent's general pose
+                    combined_data[f"{i-index_adjustment}"][:, 22:29] = trajectories_[name][interaction_start_indices[i]:approach_cutoff_indices[i], 1:8] # Position and orientation of observed agent's general pose
 
-        zero_cols = np.all(combined_data[f"{i}"][:, 1:] == 0.0, axis=0)
+        zero_cols = np.all(combined_data[f"{i-index_adjustment}"][:, 1:] == 0.0, axis=0)
         if np.any(zero_cols):
             print(f"Warning: Trajectory {i+1} has {np.sum(zero_cols)} all-zero pose columns.")
 
         # Save the combined data if required, data can be directly processed below.
         if False:
-            np.savetxt(data_dir / "processed" / f"processed_traj_{i+1}.csv", combined_data[f"{i}"], delimiter=",", header="Time,Controlled_X,Controlled_Y,Controlled_Z,Controlled_Qw,Controlled_Qx,Controlled_Qy,Controlled_Qz,Observed_X,Observed_Y,Observed_Z,Observed_Qw,Observed_Qx,Observed_Qy,Observed_Qz,Controlled_General_X,Controlled_General_Y,Controlled_General_Z,Controlled_General_Qw,Controlled_General_Qx,Controlled_General_Qy,Controlled_General_Qz,Observed_General_X,Observed_General_Y,Observed_General_Z,Observed_General_Qw,Observed_General_Qx,Observed_General_Qy,Observed_General_Qz", comments="")
+            np.savetxt(data_dir / "processed" / f"processed_traj_{i+1}.csv", combined_data[f"{i-index_adjustment}"], delimiter=",", header="Time,Controlled_X,Controlled_Y,Controlled_Z,Controlled_Qw,Controlled_Qx,Controlled_Qy,Controlled_Qz,Observed_X,Observed_Y,Observed_Z,Observed_Qw,Observed_Qx,Observed_Qy,Observed_Qz,Controlled_General_X,Controlled_General_Y,Controlled_General_Z,Controlled_General_Qw,Controlled_General_Qx,Controlled_General_Qy,Controlled_General_Qz,Observed_General_X,Observed_General_Y,Observed_General_Z,Observed_General_Qw,Observed_General_Qx,Observed_General_Qy,Observed_General_Qz", comments="")
+
+    print(f"Processed {len(combined_data)} trajectories from original {len(approach_cutoff_indices)}. Avoided trajectories: {[idx+1 for idx in avoid_indices]} due to poor data quality.")
 
     ## eBIP ##
     if True:
@@ -146,9 +177,7 @@ if __name__ == "__main__":
         training_ctrl_quats = []
         testing_trajectories = []
         n_test_trajectories = 5
-        for i in range(0, len(approach_cutoff_indices)):
-            if i == 39:
-                continue
+        for i in range(0, len(combined_data)):
             time_vec = combined_data[f"{i}"][:, 0]
             # Keep rotations as quaternions through all geometric transforms.
             ctrl_pos = combined_data[f"{i}"][:, 1:4]
@@ -240,7 +269,7 @@ if __name__ == "__main__":
             training_data[:, 3:6] = rotation_dim_reduction_continuous(ctrl_quat) if continuous_rotvec else rotation_dim_reduction(ctrl_quat)
             training_data[:, 6:9] = obs_pos
             training_data[:, 9:12] = rotation_dim_reduction_continuous(obs_quat) if continuous_rotvec else rotation_dim_reduction(obs_quat)
-            if i <= len(approach_cutoff_indices) - n_test_trajectories - 1:
+            if i <= len(combined_data) - n_test_trajectories - 1:
                 training_trajectories.append(training_data.T) # (12, T) for EBIP convention
             else:
                 # Store time alongside the 12 DoFs for convenient export/debug.
@@ -250,7 +279,7 @@ if __name__ == "__main__":
             training_ctrl_quats.append(ctrl_quat[0,:])
 
         # Visualize the trajectories
-        # for i in range(0, len(approach_cutoff_indices)):
+        # for i in range(0, len(combined_data)):
         #     visualize_pose_trajectories_matplotlib(combined_data[f"{i}"][:, 0], training_trajectories[i][:,:6], training_trajectories[i][:,6:12])
 
         mean_ctrl_start = np.zeros(3)
@@ -297,18 +326,18 @@ if __name__ == "__main__":
         # Export model + test_trajectory csv for evaluation in ros2
         model_dir = Path(__file__).parent / "models"
         model_dir.mkdir(exist_ok=True)
-        model_file = model_dir / "mirrored_handover_2026_05_8.bip"
-        # primitive.export_data(model_file)
+        model_file = model_dir / "handover_2026_05_12.bip"
+        primitive.export_data(model_file)
 
         test_save_index = 3
         # testing_trajectories entries are (13, T): [time; 12 DoFs]
         test_trajectory_save = testing_trajectories[test_save_index].T
-        test_trajectory_file = model_dir / "mirrored_handover_test_trajectory.csv"
-        # np.savetxt(test_trajectory_file, test_trajectory_save, delimiter=",", header="Time, Controlled_X, Controlled_Y, Controlled_Z, Controlled_RX, Controlled_RY, Controlled_RZ, Observed_X, Observed_Y, Observed_Z, Observed_RX, Observed_RY, Observed_RZ", comments="")
+        test_trajectory_file = model_dir / "2026_05_12_test_trajectory.csv"
+        np.savetxt(test_trajectory_file, test_trajectory_save, delimiter=",", header="Time, Controlled_X, Controlled_Y, Controlled_Z, Controlled_RX, Controlled_RY, Controlled_RZ, Observed_X, Observed_Y, Observed_Z, Observed_RX, Observed_RY, Observed_RZ", comments="")
 
         observation_noise = np.diag(selection.get_model_mse(basis_model_gaussian, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
         # mat = observation_noise
-        # print(np.array2string(mat.diagonal(), formatter={"float_kind": lambda x: f"{x:.7f}"}))
+        # print(f"Observation noise diagonal: {np.array2string(mat.diagonal(), formatter={'float_kind': lambda x: f'{x:.7f}'})}")
         phase_velocity_mean, phase_velocity_var = intprim.examples.get_phase_stats(training_trajectories)
         # print(f"Phase velocity mean: {phase_velocity_mean}, Phase velocity variance: {phase_velocity_var:.7f}")
 
@@ -320,7 +349,9 @@ if __name__ == "__main__":
         proc_var = 1e-8,
         initial_ensemble = primitive.basis_weights)
 
-        # Strip time row before evaluation; evaluate_6d_matplotlib expects (12, T).
+        # Evaluate model with unseen test trajectores. Strip time row before evaluation; evaluate_6d_matplotlib expects (12, T).
+        # for i in range(0, n_test_trajectories):
+        #     evaluate_6d_matplotlib(primitive, filter, testing_trajectories[i][1:, :], observation_noise)
         evaluate_6d_matplotlib(primitive, filter, testing_trajectories[3][1:, :], observation_noise)
 
 
