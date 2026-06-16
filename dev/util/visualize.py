@@ -421,3 +421,239 @@ def evaluate_6d_matplotlib(
 		prev_observed_index = observed_index
 
 	plt.show()
+
+
+def evaluate_6d_metrics(
+	primitive,
+	filter,
+	test_trajectory,
+	observation_noise,
+	*,
+	time_step=1,
+	observe_controlled_start=False,
+	plot=True,
+	label=None,
+):
+	"""Quantitative eBIP evaluation against a held-out test trajectory.
+
+	Runs the same online inference loop as ``evaluate_6d_matplotlib`` (observing
+	only the observed-agent DOFs, exactly as the live filter does) and compares,
+	at every inference step:
+
+	1. The inferred controlled (Baton) pose at the filter's current phase against
+	   the ground-truth controlled pose -> a reconstruction error for the DOFs the
+	   model never sees. This is the "can it recreate the interaction" number.
+	2. The filter's estimated phase against the true normalized phase of the test
+	   demo (sample index / (T-1)) -> a temporal-alignment error.
+
+	Both are measured with respect to the actual data in ``test_trajectory``.
+
+	Note on alignment: the predicted controlled pose is taken at the filter's
+	estimated phase (``gen_trajectory[:, 0]``), while the ground truth is taken at
+	the current sample index. If the phase estimate is biased, some of the
+	reconstruction error is really phase error -- read the two metrics together.
+
+	Args:
+		primitive: Trained BayesianInteractionPrimitive.
+		filter: Filter template (deep-copied per run).
+		test_trajectory: (12, T) array [ctrl pos+rotvec, obs pos+rotvec].
+		observation_noise: (12, 12) observation noise matrix.
+		time_step: Observations per inference call.
+		observe_controlled_start: If True, observe controlled position at t=0.
+		plot: If True, draw reconstruction-error and phase-tracking plots.
+		label: Optional string used in the printed summary / plot titles.
+
+	Returns:
+		dict of metric arrays and aggregate scalars (see keys below).
+	"""
+	traj = np.asarray(test_trajectory)
+	if traj.ndim != 2 or traj.shape[0] != 12:
+		raise ValueError("test_trajectory must have shape (12, T)")
+
+	T = traj.shape[1]
+	if T < 2:
+		raise ValueError("test_trajectory must have at least 2 samples")
+
+	observed_dof_indices = np.array([6, 7, 8, 9, 10, 11], dtype=np.int32)
+	observed_dof_indices_with_ctrl_pos = np.array([0, 1, 2, 6, 7, 8, 9, 10, 11], dtype=np.int32)
+
+	# Hide the controlled (Baton) DOFs from the filter, mirroring live inference.
+	traj_partial = np.array(traj, copy=True)
+	traj_partial[0:6, :] = 0.0
+	if observe_controlled_start:
+		traj_partial[0:3, 0] = traj[0:3, 0]
+
+	new_filter = copy.deepcopy(filter)
+	primitive.set_filter(new_filter)
+
+	progress = []        # fraction of the trajectory observed so far
+	true_phase = []      # ground-truth normalized phase at the latest observed sample
+	est_phase = []       # filter-estimated phase
+	recon_ctrl = []      # inferred controlled pose (6D) at the current phase
+	actual_ctrl = []     # ground-truth controlled pose (6D) at the current sample
+	endpoint_pos_err = []  # predicted vs actual handover (final) position, per step
+
+	actual_endpoint_pos = traj[0:3, -1]
+
+	prev_observed_index = 0
+	for observed_index in range(time_step, T, time_step):
+		is_first_step = (prev_observed_index == 0)
+		active_dofs = (
+			observed_dof_indices_with_ctrl_pos
+			if (is_first_step and observe_controlled_start)
+			else observed_dof_indices
+		)
+
+		num_samples = T - observed_index
+		gen_trajectory, phase, _, _ = primitive.generate_probable_trajectory_recursive(
+			traj_partial[:, prev_observed_index:observed_index],
+			observation_noise,
+			active_dofs,
+			num_samples=num_samples,
+		)
+
+		# gen_trajectory: (12, num_samples) spanning estimated phase -> 1.0.
+		# Column 0 is the controlled-state estimate at the current moment; the last
+		# column is the predicted handover (end of approach) pose.
+		current_sample = observed_index - 1  # last observed sample index
+		recon_ctrl.append(gen_trajectory[0:6, 0])
+		actual_ctrl.append(traj[0:6, current_sample])
+		endpoint_pos_err.append(float(np.linalg.norm(gen_trajectory[0:3, -1] - actual_endpoint_pos)))
+
+		progress.append(observed_index / (T - 1))
+		true_phase.append(current_sample / (T - 1))
+		est_phase.append(float(phase))
+
+		prev_observed_index = observed_index
+
+	progress = np.asarray(progress)
+	true_phase = np.asarray(true_phase)
+	est_phase = np.asarray(est_phase)
+	recon_ctrl = np.asarray(recon_ctrl)      # (S, 6)
+	actual_ctrl = np.asarray(actual_ctrl)    # (S, 6)
+	endpoint_pos_err = np.asarray(endpoint_pos_err)
+
+	pos_err = recon_ctrl[:, 0:3] - actual_ctrl[:, 0:3]
+	rot_err = recon_ctrl[:, 3:6] - actual_ctrl[:, 3:6]
+	per_step_pos_err = np.linalg.norm(pos_err, axis=1)  # euclidean position error per step
+	phase_error = est_phase - true_phase
+
+	metrics = {
+		"label": label,
+		"progress": progress,
+		"true_phase": true_phase,
+		"est_phase": est_phase,
+		"phase_error": phase_error,
+		"phase_rmse": float(np.sqrt(np.mean(phase_error ** 2))),
+		"phase_mae": float(np.mean(np.abs(phase_error))),
+		"recon_ctrl": recon_ctrl,
+		"actual_ctrl": actual_ctrl,
+		"per_step_pos_err": per_step_pos_err,
+		"pos_mse": float(np.mean(pos_err ** 2)),
+		"rot_mse": float(np.mean(rot_err ** 2)),
+		"pos_rmse": float(np.sqrt(np.mean(pos_err ** 2))),
+		"rot_rmse": float(np.sqrt(np.mean(rot_err ** 2))),
+		"endpoint_pos_err": endpoint_pos_err,
+		"final_endpoint_pos_err": float(endpoint_pos_err[-1]),
+	}
+
+	tag = f" [{label}]" if label else ""
+	print(
+		f"eBIP metrics{tag}: "
+		f"ctrl pos RMSE = {metrics['pos_rmse']*1000:.1f} mm, "
+		f"ctrl rot RMSE = {np.degrees(metrics['rot_rmse']):.2f} deg, "
+		f"phase RMSE = {metrics['phase_rmse']:.4f} (MAE {metrics['phase_mae']:.4f}), "
+		f"final handover pos err = {metrics['final_endpoint_pos_err']*1000:.1f} mm"
+	)
+
+	if plot:
+		fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+		title = f"eBIP evaluation{tag}"
+		fig.suptitle(title)
+
+		axes[0].plot(progress, per_step_pos_err * 1000.0, color="dodgerblue")
+		axes[0].set_title("Controlled position reconstruction error")
+		axes[0].set_xlabel("Fraction of interaction observed")
+		axes[0].set_ylabel("Position error (mm)")
+		axes[0].grid(True)
+
+		axes[1].plot([0, 1], [0, 1], color="gray", linestyle="--", label="ideal")
+		axes[1].plot(true_phase, est_phase, color="tomato", label="estimated")
+		axes[1].set_title("Phase tracking")
+		axes[1].set_xlabel("True phase")
+		axes[1].set_ylabel("Estimated phase")
+		axes[1].legend()
+		axes[1].grid(True)
+
+		axes[2].plot(progress, endpoint_pos_err * 1000.0, color="limegreen")
+		axes[2].set_title("Handover-point prediction error")
+		axes[2].set_xlabel("Fraction of interaction observed")
+		axes[2].set_ylabel("Predicted endpoint error (mm)")
+		axes[2].grid(True)
+
+		fig.tight_layout()
+
+	return metrics
+
+
+def mean_trajectory_baseline_metrics(primitive, test_trajectory, *, label=None):
+	"""Mean-trajectory baseline for the controlled (Baton) reconstruction.
+
+	Ignores the observation entirely: it outputs the training-mean controlled
+	trajectory (the eBIP prior mean, ``primitive.get_probability_distribution``)
+	and scores it against the test demo with the same position/rotation RMSE and
+	handover-endpoint metrics as ``evaluate_6d_metrics``.
+
+	This is the floor any useful eBIP must beat. It captures only that handovers
+	all look roughly alike; it uses nothing about what the receiver does on this
+	run. If eBIP's RMSE is close to this number, the filter is not really
+	conditioning on the observed agent -- it is just replaying the average.
+
+	Note: both the mean trajectory and the test demo are time-normalized over
+	phase 0->1 with the same length, so this baseline is compared with perfect
+	timing (no phase error). That makes it a conservative -- i.e. strong -- floor:
+	beating a phase-aligned mean trajectory is more convincing, not less.
+
+	Args:
+		primitive: Trained BayesianInteractionPrimitive.
+		test_trajectory: (12, T) array [ctrl pos+rotvec, obs pos+rotvec].
+		label: Optional string used in the printed summary.
+
+	Returns:
+		dict of aggregate scalars (keys match the comparable subset of
+		``evaluate_6d_metrics``).
+	"""
+	traj = np.asarray(test_trajectory)
+	if traj.ndim != 2 or traj.shape[0] != 12:
+		raise ValueError("test_trajectory must have shape (12, T)")
+	T = traj.shape[1]
+	if T < 2:
+		raise ValueError("test_trajectory must have at least 2 samples")
+
+	# Training-mean trajectory over phase 0->1, resampled to the test length.
+	mean_traj, _, _ = primitive.get_probability_distribution(num_samples=T)
+	mean_traj = np.asarray(mean_traj)
+
+	pos_err = mean_traj[0:3, :] - traj[0:3, :]
+	rot_err = mean_traj[3:6, :] - traj[3:6, :]
+	endpoint_pos_err = float(np.linalg.norm(mean_traj[0:3, -1] - traj[0:3, -1]))
+
+	metrics = {
+		"label": label,
+		"mean_trajectory": mean_traj,
+		"per_step_pos_err": np.linalg.norm(pos_err, axis=0),
+		"pos_mse": float(np.mean(pos_err ** 2)),
+		"rot_mse": float(np.mean(rot_err ** 2)),
+		"pos_rmse": float(np.sqrt(np.mean(pos_err ** 2))),
+		"rot_rmse": float(np.sqrt(np.mean(rot_err ** 2))),
+		"final_endpoint_pos_err": endpoint_pos_err,
+	}
+
+	tag = f" [{label}]" if label else ""
+	print(
+		f"mean-traj baseline{tag}: "
+		f"ctrl pos RMSE = {metrics['pos_rmse']*1000:.1f} mm, "
+		f"ctrl rot RMSE = {np.degrees(metrics['rot_rmse']):.2f} deg, "
+		f"final handover pos err = {metrics['final_endpoint_pos_err']*1000:.1f} mm"
+	)
+	return metrics

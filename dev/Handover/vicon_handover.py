@@ -9,6 +9,7 @@ from dev.util.process import (
     apply_local_axis_rotation_offset_to_quats,
     apply_reflection_to_positions,
     apply_reflection_to_quats,
+    combine_data,
     compute_cutoff,
     compute_euclidean_distance,
     csv_to_dict,
@@ -16,22 +17,32 @@ from dev.util.process import (
     get_interaction_start_indices,
     get_traj_start_indices,
     mirror_trajectory_quats_using_head_plane,
-    rebase_to_head_midpoint_floor_yaw_quat,
+    rebase_to_observed_head_floor_yaw_quat,
     segment_trajectories,
 )
-from dev.util.visualize import evaluate_6d_matplotlib
+from dev.util.visualize import (
+    evaluate_6d_matplotlib,
+    evaluate_6d_metrics,
+    mean_trajectory_baseline_metrics,
+)
 
 if __name__ == "__main__":
     np.random.seed(213413414)
-    data_date = "2026_05_12"
-    data_dir = Path(__file__).parent / data_date
-    # Import data from csv files in the data directory and store in a dictionary of numpy arrays.
-    data_ = csv_to_dict(data_dir)
-    
+    # data_date = ["BH1_2026_06_12", "BH2_2026_06_12"]
+    data_date = ["BH1_2026_06_12"]
+    object_names = ["Baton", "Receiver_Hand", "Hat_Giver", "Hat_Receiver"]
+    data_dict = {}
+    for date in data_date:
+        data_dir = Path(__file__).parent / date
+        # Import data from csv files in the data directory and store in a dictionary of numpy arrays.
+        data_dict[date] = csv_to_dict(data_dir)
+    # Merge every recording session into a single object-indexed dictionary.
+    data_ = combine_data(data_dict, object_names=object_names)
+
     start_indices_ = {}
     for name in data_:
         start_indices_[name] = get_traj_start_indices(data_[name])
-    
+    print(f"Number of start indices: { {name: len(start_indices_[name]) for name in start_indices_} }")
 
     trajectories_ = segment_trajectories(data_, start_indices_, print_info=False)
 
@@ -44,12 +55,19 @@ if __name__ == "__main__":
     apply_post_mirror_z_pi = False  # Apply constant local-axis rotation offset to both agents
     post_mirror_offset_axis = "z"  # only used when apply_post_mirror_z_pi=True
     post_mirror_offset_angle = np.pi - np.pi/16
-    rebase_to_head_midpoint_floor = True
+    rebase_to_observed_head_floor = True
 
     rebase_yaw_mode = "legacy_euler"  # or: "projected_forward"
     rebase_body_forward_axis = "x"    # used only when rebase_yaw_mode == "projected_forward"
 
     continuous_rotvec = True
+
+    # EnKF ensemble size. One member per demo (~50) leaves the stochastic filter
+    # swinging with the RNG seed; inflating to 300 (extra members sampled from the
+    # trained weight distribution) makes it effectively seed-invariant (LOO sweep:
+    # across-seed std 0.73 mm @ one-per-demo -> 0.21 mm @ 300, mean unchanged).
+    # The live ROS2 EnKF MUST use this same size or train/live filters diverge.
+    ensemble_size = 300
 
     debug_axes = False
 
@@ -78,23 +96,22 @@ if __name__ == "__main__":
     # Compute the handover location cutoff for each trajectory segment in order to process only the approach to handover phase of the interaction.
     approach_cutoff_indices = []
     for i in range(0, len(start_indices_[controlled_agent])):
-        if i == len(start_indices_[controlled_agent]) - 1: # Final trajectory for initial data collection had high noise and will be dismissed
-            break
         approach_cutoff_indices.append(compute_cutoff(euclidean_distance[f"{i}"]))
 
     # Plot cutoff values with euclidean distance for each trajectory segment.
     if False:
-        # for i in range(0, len(approach_cutoff_indices)):
-        for i in range(0, 5):
-            plt.figure()
-            plt.title(f"Euclidean Distance between {controlled_agent} and {observed_agent} for Trajectory {i+1}")
-            plt.plot(trajectories_[f"{controlled_agent}_{i}"][:, 0], euclidean_distance[f"{i}"], label="Euclidean Distance")
-            plt.vlines(x=trajectories_[f"{controlled_agent}_{i}"][approach_cutoff_indices[i], 0], ymin= min(euclidean_distance[f"{i}"]), ymax=max(euclidean_distance[f"{i}"]), color="red", linestyle="--", label="Handover Location Cutoff")
-            plt.xlabel("Time (s)")
-            plt.ylabel("Distance (m)")
-            plt.legend()
-            plt.grid()  
-            plt.show()
+        for i in range(0, len(approach_cutoff_indices)):
+        # for i in range(0, 5):
+            if i in [25,69,113]:
+                plt.figure()
+                plt.title(f"Euclidean Distance between {controlled_agent} and {observed_agent} for Trajectory {i+1}")
+                plt.plot(trajectories_[f"{controlled_agent}_{i}"][:, 0], euclidean_distance[f"{i}"], label="Euclidean Distance")
+                plt.vlines(x=trajectories_[f"{controlled_agent}_{i}"][approach_cutoff_indices[i], 0], ymin= min(euclidean_distance[f"{i}"]), ymax=max(euclidean_distance[f"{i}"]), color="red", linestyle="--", label="Handover Location Cutoff")
+                plt.xlabel("Time (s)")
+                plt.ylabel("Distance (m)")
+                plt.legend()
+                plt.grid()  
+                plt.show()
     
     # for i in range(0, len(approach_cutoff_indices)):
     #     plt.figure()
@@ -120,6 +137,7 @@ if __name__ == "__main__":
             steady_state_window=min(200, n_samples),
             min_consecutive=min(50, n_samples),
             direction="up",
+            pre_roll=60,  # 0.2 s at 240 Hz: include some at-rest observations before onset
         )
         if interaction_start_idx is None:
             interaction_start_idx = 0
@@ -135,7 +153,7 @@ if __name__ == "__main__":
         
     # print(f"Interaction start indices: {interaction_start_indices}")
 
-    avoid_indices = [3, 4] # Trajectories 4 and 5 have poor data quality and will be removed from training/testing data
+    avoid_indices = [7, 10, 26, 28, 56] # Refined BH1 exclusions (0-based): zero-length segment, two 5-sigma baton-start mis-segmentations, two phase stalls. Removed from training/testing.
     index_adjustment = 0
 
     combined_data = {}
@@ -175,8 +193,16 @@ if __name__ == "__main__":
     if True:
         training_trajectories = []
         training_ctrl_quats = []
+        training_ctrl_head_pos = []
+        training_obs_head_pos = []
         testing_trajectories = []
-        n_test_trajectories = 5
+        n_test_trajectories = 1
+        # Hold out a random sample of demos as the test set (reproducible via the
+        # seed set at top of __main__) rather than the trailing demos, which would
+        # all come from the last session and not be representative.
+        test_indices = set(
+            np.random.choice(len(combined_data), size=n_test_trajectories, replace=False).tolist()
+        )
         for i in range(0, len(combined_data)):
             time_vec = combined_data[f"{i}"][:, 0]
             # Keep rotations as quaternions through all geometric transforms.
@@ -218,8 +244,8 @@ if __name__ == "__main__":
 
                 
 
-            if rebase_to_head_midpoint_floor:
-                ctrl_pos, ctrl_quat, obs_pos, obs_quat = rebase_to_head_midpoint_floor_yaw_quat(
+            if rebase_to_observed_head_floor:
+                ctrl_pos, ctrl_quat, obs_pos, obs_quat, ctrl_head_pos, obs_head_pos = rebase_to_observed_head_floor_yaw_quat(
                     ctrl_pos,
                     ctrl_quat,
                     obs_pos,
@@ -229,8 +255,8 @@ if __name__ == "__main__":
                     observed_head_quats=obs_head_quat,
                     yaw_mode=rebase_yaw_mode,
                     body_forward_axis=rebase_body_forward_axis,
-                    midpoint_time="mean",
                     floor_z=0.0,
+                    return_head_positions=True,
                 )
 
                 if debug_axes and i == 0:
@@ -269,29 +295,42 @@ if __name__ == "__main__":
             training_data[:, 3:6] = rotation_dim_reduction_continuous(ctrl_quat) if continuous_rotvec else rotation_dim_reduction(ctrl_quat)
             training_data[:, 6:9] = obs_pos
             training_data[:, 9:12] = rotation_dim_reduction_continuous(obs_quat) if continuous_rotvec else rotation_dim_reduction(obs_quat)
-            if i <= len(combined_data) - n_test_trajectories - 1:
-                training_trajectories.append(training_data.T) # (12, T) for EBIP convention
-            else:
+            if i in test_indices:
                 # Store time alongside the 12 DoFs for convenient export/debug.
                 # Shape: (13, T) = [time; 12 DoFs]
                 testing_trajectories.append(np.vstack((time_vec[None, :], training_data.T)))
+            else:
+                training_trajectories.append(training_data.T) # (12, T) for EBIP convention
 
             training_ctrl_quats.append(ctrl_quat[0,:])
+            training_ctrl_head_pos.append(ctrl_head_pos[0,:])
+            training_obs_head_pos.append(obs_head_pos[0,:])
 
         # Visualize the trajectories
         # for i in range(0, len(combined_data)):
         #     visualize_pose_trajectories_matplotlib(combined_data[f"{i}"][:, 0], training_trajectories[i][:,:6], training_trajectories[i][:,6:12])
 
-        mean_ctrl_start = np.zeros(3)
-        mean_ctrl_start[0] = np.mean([traj[0, 0] for traj in training_trajectories])
-        mean_ctrl_start[1] = np.mean([traj[1, 0] for traj in training_trajectories])
-        mean_ctrl_start[2] = np.mean([traj[2, 0] for traj in training_trajectories])
-        print(f"Mean starting position of controlled agent across training trajectories: {mean_ctrl_start}")
-        print(f"+X axis forward from controlled agent's starting position")
+        print_mean_info = True
+        if print_mean_info:
+            mean_ctrl_start = np.zeros(3)
+            mean_ctrl_start[0] = np.mean([traj[0, 0] for traj in training_trajectories])
+            mean_ctrl_start[1] = np.mean([traj[1, 0] for traj in training_trajectories])
+            mean_ctrl_start[2] = np.mean([traj[2, 0] for traj in training_trajectories])
+            mean_obs_start = np.zeros(3)
+            mean_obs_start[0] = np.mean([traj[6, 0] for traj in training_trajectories])
+            mean_obs_start[1] = np.mean([traj[7, 0] for traj in training_trajectories])
+            mean_obs_start[2] = np.mean([traj[8, 0] for traj in training_trajectories])
+            print(f"Mean starting position of controlled agent across training trajectories: {mean_ctrl_start}")
+            print(f"Mean starting position of observed agent across training trajectories: {mean_obs_start}")
 
-        # print(f"Starting quat shape of entire list: {np.array(training_ctrl_quats).shape}")
-        mean_ctrl_quat_start = np.mean(training_ctrl_quats, axis=0)
-        print(f"Mean starting quaternion of controlled agent across training trajectories: {mean_ctrl_quat_start} (qw, qx, qy, qz)")
+            # print(f"Starting quat shape of entire list: {np.array(training_ctrl_quats).shape}")
+            mean_ctrl_quat_start = np.mean(training_ctrl_quats, axis=0)
+            print(f"Mean starting quaternion of controlled agent across training trajectories: {mean_ctrl_quat_start} (qw, qx, qy, qz)")
+
+            print(f"Mean starting head position of controlled agent across training trajectories: {np.mean(training_ctrl_head_pos, axis=0)} (x, y, z)")
+            print(f"Mean starting head position of observed agent across training trajectories: {np.mean(training_obs_head_pos, axis=0)} (x, y, z)")
+            mean_spacing = np.abs(np.mean(training_obs_head_pos, axis=0) - np.mean(training_ctrl_head_pos, axis=0))
+            print(f"Mean head spacing between agents across training trajectories: {mean_spacing} (x, y, z)")
 
 
 
@@ -312,7 +351,7 @@ if __name__ == "__main__":
         # selection.get_best_model(aic, bic)
 
         # basis_model_sigmoidal = intprim.basis.SigmoidalModel(11, 0.01, dof_names)
-        basis_model_gaussian = intprim.basis.GaussianModel(5, 0.19, dof_names)
+        basis_model_gaussian = intprim.basis.GaussianModel(5, 0.16, dof_names)
         
 
         primitive = intprim.BayesianInteractionPrimitive(basis_model_gaussian)
@@ -326,20 +365,36 @@ if __name__ == "__main__":
         # Export model + test_trajectory csv for evaluation in ros2
         model_dir = Path(__file__).parent / "models"
         model_dir.mkdir(exist_ok=True)
-        model_file = model_dir / "handover_2026_05_12.bip"
+        model_file = model_dir / "handover_2026_06_12.bip"
         primitive.export_data(model_file)
 
-        test_save_index = 3
+        test_save_index = 0
         # testing_trajectories entries are (13, T): [time; 12 DoFs]
         test_trajectory_save = testing_trajectories[test_save_index].T
-        test_trajectory_file = model_dir / "2026_05_12_test_trajectory.csv"
+        test_trajectory_file = model_dir / "2026_06_12_test_trajectory.csv"
         np.savetxt(test_trajectory_file, test_trajectory_save, delimiter=",", header="Time, Controlled_X, Controlled_Y, Controlled_Z, Controlled_RX, Controlled_RY, Controlled_RZ, Observed_X, Observed_Y, Observed_Z, Observed_RX, Observed_RY, Observed_RZ", comments="")
 
         observation_noise = np.diag(selection.get_model_mse(basis_model_gaussian, np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])))
-        # mat = observation_noise
-        # print(f"Observation noise diagonal: {np.array2string(mat.diagonal(), formatter={'float_kind': lambda x: f'{x:.7f}'})}")
+        mat = observation_noise
+        print(f"Observation noise diagonal: {np.array2string(mat.diagonal(), formatter={'float_kind': lambda x: f'{x:.7f}'})}")
         phase_velocity_mean, phase_velocity_var = intprim.examples.get_phase_stats(training_trajectories)
-        # print(f"Phase velocity mean: {phase_velocity_mean}, Phase velocity variance: {phase_velocity_var:.7f}")
+        print(f"Phase velocity mean: {phase_velocity_mean}, Phase velocity variance: {phase_velocity_var:.7f}")
+
+        # Inflate the EnKF ensemble to `ensemble_size` members for run-to-run
+        # consistency: keep the real demo weights as members and top up with
+        # samples from the trained basis-weight distribution. Reseed first so the
+        # draw is reproducible regardless of earlier RNG use (e.g. the test split).
+        np.random.seed(213413414)
+        weight_mean, weight_cov = primitive.get_basis_weight_parameters()
+        if weight_cov is not None and ensemble_size > primitive.basis_weights.shape[0]:
+            extra_members = np.random.multivariate_normal(
+                weight_mean, weight_cov,
+                size=ensemble_size - primitive.basis_weights.shape[0],
+                check_valid="ignore",
+            )
+            initial_ensemble = np.vstack([primitive.basis_weights, extra_members])
+        else:
+            initial_ensemble = primitive.basis_weights
 
         #Define a filter to use. Here we use an ensemble Kalman filter
         filter = intprim.filter.spatiotemporal.EnsembleKalmanFilter(
@@ -347,12 +402,69 @@ if __name__ == "__main__":
         initial_phase_mean = [0.0, phase_velocity_mean],
         initial_phase_var = [1e-4, phase_velocity_var],
         proc_var = 1e-8,
-        initial_ensemble = primitive.basis_weights)
+        initial_ensemble = initial_ensemble)
 
-        # Evaluate model with unseen test trajectores. Strip time row before evaluation; evaluate_6d_matplotlib expects (12, T).
+        # Quantitative evaluation across all held-out test trajectories.
+        # Strip the time row before evaluation; evaluators expect (12, T).
+        all_metrics = []
+        baseline_metrics = []
+        for i in range(len(testing_trajectories)):
+            m = evaluate_6d_metrics(
+                primitive,
+                filter,
+                testing_trajectories[i][1:, :],
+                observation_noise,
+                label=f"test {i}",
+                plot=(i == 0),  # plot the first; aggregate the rest
+            )
+            all_metrics.append(m)
+            # Mean-trajectory baseline (ignores the observation) for the same demo.
+            b = mean_trajectory_baseline_metrics(
+                primitive,
+                testing_trajectories[i][1:, :],
+                label=f"test {i}",
+            )
+            baseline_metrics.append(b)
+
+        pos_rmse = np.array([m["pos_rmse"] for m in all_metrics])
+        rot_rmse = np.array([m["rot_rmse"] for m in all_metrics])
+        phase_rmse = np.array([m["phase_rmse"] for m in all_metrics])
+        endpoint_err = np.array([m["final_endpoint_pos_err"] for m in all_metrics])
+        base_pos_rmse = np.array([m["pos_rmse"] for m in baseline_metrics])
+        base_rot_rmse = np.array([m["rot_rmse"] for m in baseline_metrics])
+        base_endpoint_err = np.array([m["final_endpoint_pos_err"] for m in baseline_metrics])
+        print("\n=== Held-out summary (mean +/- std over test demos) ===")
+        print(f"  {'metric':26s} {'eBIP':>20s} {'mean-traj baseline':>22s}")
+        print(f"  {'Controlled position RMSE':26s} "
+              f"{pos_rmse.mean()*1000:8.1f} +/- {pos_rmse.std()*1000:5.1f} mm "
+              f"{base_pos_rmse.mean()*1000:10.1f} +/- {base_pos_rmse.std()*1000:5.1f} mm")
+        print(f"  {'Controlled rotation RMSE':26s} "
+              f"{np.degrees(rot_rmse.mean()):8.2f} +/- {np.degrees(rot_rmse.std()):5.2f} dg "
+              f"{np.degrees(base_rot_rmse.mean()):10.2f} +/- {np.degrees(base_rot_rmse.std()):5.2f} dg")
+        print(f"  {'Final handover pos error':26s} "
+              f"{endpoint_err.mean()*1000:8.1f} +/- {endpoint_err.std()*1000:5.1f} mm "
+              f"{base_endpoint_err.mean()*1000:10.1f} +/- {base_endpoint_err.std()*1000:5.1f} mm")
+        print(f"  {'Phase RMSE':26s} "
+              f"{phase_rmse.mean():8.4f} +/- {phase_rmse.std():7.4f}    "
+              f"{'n/a (open-loop)':>22s}")
+        gain = 100.0 * (1.0 - pos_rmse.mean() / base_pos_rmse.mean())
+        print(f"\n  eBIP reduces controlled position RMSE by {gain:.0f}% vs the mean-trajectory baseline.")
+
+        # Visual inspection of one test trajectory (existing eyeball check).
+        evaluate_6d_matplotlib(primitive, filter, testing_trajectories[0][1:, :], observation_noise)
+
         # for i in range(0, n_test_trajectories):
         #     evaluate_6d_matplotlib(primitive, filter, testing_trajectories[i][1:, :], observation_noise)
-        evaluate_6d_matplotlib(primitive, filter, testing_trajectories[3][1:, :], observation_noise)
+        
+        # Evaluation with induced start delay
+        # prepend = 50
+        # T = testing_trajectories[3].shape[1]
+        # static_test_traj = np.zeros((12, T + prepend))  # (12, T_extended)
+        # # copy full test trajectory into extended array starting at index `prepend`
+        # static_test_traj[:, prepend:prepend+T] = testing_trajectories[3][1:, :]  # (12, T)
+        # # hold the first frame for `prepend` indices to create quasi-static start
+        # static_test_traj[:, :prepend] = np.tile(testing_trajectories[3][1:, 0:1], (1, prepend))
+        # evaluate_6d_matplotlib(primitive, filter, static_test_traj, observation_noise)
 
 
 

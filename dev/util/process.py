@@ -339,7 +339,7 @@ def apply_local_axis_rotation_offset_to_quats(
     return _quat_scalar_first_from_rotation(Rotation.from_matrix(mats_new), Rotation)
 
 
-def rebase_to_head_midpoint_floor_yaw_quat(
+def rebase_to_observed_head_floor_yaw_quat(
     controlled_positions,
     controlled_quats,
     observed_positions,
@@ -350,17 +350,26 @@ def rebase_to_head_midpoint_floor_yaw_quat(
     observed_head_quats,
     yaw_mode="legacy_euler",
     body_forward_axis="x",
-    midpoint_time="mean",
     floor_z=0.0,
     return_anchor=False,
+    return_head_positions=False,
 ):
-    """Rebase pos+quat streams to a head-midpoint floor origin and observed-head yaw.
+    """Rebase pos+quat streams to the observed-head floor origin and observed-head yaw.
 
-    - Origin: floor-projected midpoint between controlled/observed head positions.
-    - Orientation: yaw-only about global +Z extracted from the observed head quaternion
-      at the start of the segment.
+    The interaction origin is built from the OBSERVED (receiver) agent only, so it
+    has a live counterpart at inference (the receiver is the sole observed agent;
+    there is no giver-head marker live). Both origin components are taken at
+    segment ONSET (index 0) and held fixed for the segment, mirroring the live
+    construction which freezes the origin at onset:
+    - Origin: observed (receiver) head position at onset, projected to the floor
+      plane (z = floor_z).
+    - Orientation: yaw-only about global +Z extracted from the observed head
+      quaternion at onset.
 
     Quaternion convention is scalar-first (w,x,y,z).
+
+    If return_head_positions is True, returns rebased head positions for
+    controlled and observed streams.
     """
     ctrl_pos = np.asarray(controlled_positions, dtype=float)
     obs_pos = np.asarray(observed_positions, dtype=float)
@@ -385,18 +394,26 @@ def rebase_to_head_midpoint_floor_yaw_quat(
         raise ValueError("observed_head_quats must have shape (T,4)")
 
     if ctrl_pos.shape[0] == 0:
+        if return_anchor and return_head_positions:
+            return (
+                ctrl_pos,
+                ctrl_q,
+                obs_pos,
+                obs_q,
+                (np.zeros(3), np.eye(3), 0.0),
+                ctrl_head_pos,
+                obs_head_pos,
+            )
         if return_anchor:
             return ctrl_pos, ctrl_q, obs_pos, obs_q, (np.zeros(3), np.eye(3), 0.0)
+        if return_head_positions:
+            return ctrl_pos, ctrl_q, obs_pos, obs_q, ctrl_head_pos, obs_head_pos
         return ctrl_pos, ctrl_q, obs_pos, obs_q
 
-    midpoint_time_l = str(midpoint_time).lower()
-    if midpoint_time_l not in ("mean",):
-        raise ValueError(f"Unsupported midpoint_time: {midpoint_time!r} (expected 'mean')")
-
-    p_ctrl = np.mean(ctrl_head_pos, axis=0) if ctrl_head_pos.shape[0] else np.zeros(3)
-    p_obs = np.mean(obs_head_pos, axis=0) if obs_head_pos.shape[0] else np.zeros(3)
-    p0 = 0.5 * (p_ctrl + p_obs)
-    p0 = np.asarray(p0, dtype=float)
+    # Origin = observed (receiver) head position at ONSET, projected to the floor.
+    # Frozen at index 0 to match the live construction (no averaging over the
+    # future, which has no inference-time counterpart).
+    p0 = np.array(obs_head_pos[0], dtype=float)
     p0[2] = float(floor_z)
 
     try:
@@ -420,6 +437,8 @@ def rebase_to_head_midpoint_floor_yaw_quat(
 
     ctrl_pos_r = (ctrl_pos - p0) @ R_inv.T
     obs_pos_r = (obs_pos - p0) @ R_inv.T
+    ctrl_head_pos_r = (ctrl_head_pos - p0) @ R_inv.T
+    obs_head_pos_r = (obs_head_pos - p0) @ R_inv.T
 
     ctrl_mats = _rotation_from_quat_scalar_first(ctrl_q, Rotation).as_matrix()
     obs_mats = _rotation_from_quat_scalar_first(obs_q, Rotation).as_matrix()
@@ -428,8 +447,20 @@ def rebase_to_head_midpoint_floor_yaw_quat(
     ctrl_q_r = _quat_scalar_first_from_rotation(Rotation.from_matrix(ctrl_mats_r), Rotation)
     obs_q_r = _quat_scalar_first_from_rotation(Rotation.from_matrix(obs_mats_r), Rotation)
 
+    if return_anchor and return_head_positions:
+        return (
+            ctrl_pos_r,
+            ctrl_q_r,
+            obs_pos_r,
+            obs_q_r,
+            (p0, R_base, float(yaw0)),
+            ctrl_head_pos_r,
+            obs_head_pos_r,
+        )
     if return_anchor:
         return ctrl_pos_r, ctrl_q_r, obs_pos_r, obs_q_r, (p0, R_base, float(yaw0))
+    if return_head_positions:
+        return ctrl_pos_r, ctrl_q_r, obs_pos_r, obs_q_r, ctrl_head_pos_r, obs_head_pos_r
     return ctrl_pos_r, ctrl_q_r, obs_pos_r, obs_q_r
 
 
@@ -452,7 +483,9 @@ def get_traj_start_indices(traj_data, time_threshold=0.5):
     time_prev = traj_data[0, 0]
 
     for i in range(1, len(traj_data)):
-        if traj_data[i, 0] - time_prev > time_threshold:
+        # Use abs() so backward time jumps (e.g. when sessions whose time columns
+        # each restart at 0 are concatenated) are also treated as trajectory starts.
+        if np.abs(traj_data[i, 0] - time_prev) > time_threshold:
             start_indices.append(i)
         time_prev = traj_data[i, 0]
 
@@ -508,8 +541,14 @@ def get_interaction_start_indices(
     z_sigma=4.0,
     min_consecutive=5,
     direction="up",
+    pre_roll=0,
 ):
-    """Get the starting indices of interaction phases based on when the receiver's hand begins to move."""
+    """Get the starting indices of interaction phases based on when the receiver's hand begins to move.
+
+    ``pre_roll`` backs the detected onset up by that many frames (clamped at 0) so the
+    returned segment includes some stationary observations of the observed agent before
+    motion begins, giving the model a better representation of the start-from-rest phase.
+    """
     z_values = trajectory[:, 3]  # Assuming z-axis is vertical and trajectory is in the order [time, x, y, z]
     starting_point = np.mean(z_values[:steady_state_window])
     cutoff_margin = z_sigma * np.std(z_values[:steady_state_window])
@@ -527,8 +566,41 @@ def get_interaction_start_indices(
         if triggered:
             consecutive += 1
             if consecutive >= min_consecutive:
-                return i - min_consecutive + 1
+                return max(0, i - min_consecutive + 1 - pre_roll)
         else:
             consecutive = 0
 
     return None
+
+
+def combine_data(data_dict, object_names=None):
+    """Combine per-session trajectory data into a single object-indexed dictionary.
+
+    Expects ``data_dict`` to be a nested mapping of ``{session_name: {object_name: np.array}}``
+    (as produced by calling ``csv_to_dict`` per recording session). Each object's data is
+    concatenated across every session, in session-insertion order, into a flat
+    ``{object_name: np.array}`` dictionary suitable for the rest of the pipeline.
+
+    If ``object_names`` is provided, only those objects are combined; otherwise every object
+    found in the sessions is combined.
+    """
+    if data_dict is None or len(data_dict) == 0:
+        return {}
+
+    sessions = list(data_dict.values())
+
+    # Determine which objects to combine, preserving order of first appearance.
+    if object_names is None:
+        object_names = []
+        for session in sessions:
+            for name in session:
+                if name not in object_names:
+                    object_names.append(name)
+
+    combined_data = {}
+    for name in object_names:
+        segments = [session[name] for session in sessions if name in session]
+        if not segments:
+            continue
+        combined_data[name] = np.concatenate(segments, axis=0)
+    return combined_data
